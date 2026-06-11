@@ -5048,6 +5048,52 @@ static void session_clear_image_signature(sf37_session *s) {
     s->image_signature_rows = 0;
 }
 
+static bool session_prepare_image_signature(sf37_session *s,
+                                            const sf37_tokens *prompt,
+                                            const sf37_image_features *features,
+                                            uint32_t *image_rows,
+                                            sf37_image_signature *image_sig,
+                                            char *err,
+                                            size_t errlen) {
+    if (image_rows) *image_rows = 0;
+    if (image_sig) memset(image_sig, 0, sizeof(*image_sig));
+    if (!features) return true;
+    if (!s || !s->engine || !prompt) {
+        session_set_err(err, errlen, "invalid image feature context");
+        return false;
+    }
+
+    uint32_t rows = 0;
+    const bool has_pixels =
+        (features->pixel_values && features->images > 0) ||
+        (features->patch_pixel_values && features->patch_images > 0);
+    if (!image_features_effective_rows(features, &rows, err, errlen)) return false;
+    if (!has_pixels && features->rows > 0 && !features->data) {
+        session_set_err(err, errlen, "image features have rows but no data");
+        return false;
+    }
+    if (!has_pixels && features->rows > 0 &&
+        features->dim != SF37_EMBD &&
+        features->dim != SF37_VISION_PROJECTOR_IN) {
+        session_set_err(err, errlen, "unsupported image feature dim %u", features->dim);
+        return false;
+    }
+    const uint32_t patches = prompt_count_im_patch(s->engine, prompt, 0, (uint32_t)prompt->len);
+    if (patches != rows) {
+        session_set_err(err, errlen,
+                        "<im_patch> count %u does not match image feature rows %u",
+                        patches, rows);
+        return false;
+    }
+
+    if (image_rows) *image_rows = rows;
+    if (rows > 0 && image_sig &&
+        !image_signature_from_features(features, rows, image_sig, err, errlen)) {
+        return false;
+    }
+    return true;
+}
+
 #ifdef SF37_USE_CUDA
 static bool cuda_batch_prefill_disabled(void) {
     return sf37_env_present("SF37_CUDA_NO_BATCH_PREFILL", NULL);
@@ -6495,11 +6541,41 @@ void sf37_session_rewind(sf37_session *s, int pos) {
     if (pos > s->checkpoint.len) pos = s->checkpoint.len;
     s->checkpoint.len = pos;
     s->checkpoint_valid = true;
+    if (pos == 0) session_clear_image_signature(s);
     if (!session_uses_cuda(s)) {
         for (uint32_t il = 0; il < SF37_MAIN_LAYERS; il++) {
             s->cpu_cache.layer[il].n = (uint32_t)pos;
         }
     }
+}
+
+static bool session_rewind_preserves_kv(const sf37_session *s, int pos) {
+    if (!s || !s->checkpoint_valid || pos < 0 || pos > s->checkpoint.len) return false;
+    if (pos == s->checkpoint.len) return true;
+    if (!session_uses_cuda(s)) return true;
+#ifdef SF37_USE_CUDA
+    if (!s->cuda_state_ready) return false;
+    const uint32_t live = (uint32_t)s->checkpoint.len;
+    const uint32_t target = (uint32_t)pos;
+    for (uint32_t il = 0; il < SF37_MAIN_LAYERS; il++) {
+        const uint32_t cap = session_layer_kv_cap(s, il);
+        if (cap == 0) return false;
+        if (layer_is_full(il)) {
+            if (live > cap) return false;
+            continue;
+        }
+        const uint32_t retained_start = live > cap ? live - cap : 0u;
+        uint32_t needed_start = 0;
+        const uint32_t next_have = target + 1u;
+        if (next_have > SF37_SLIDING_WINDOW) {
+            needed_start = next_have - SF37_SLIDING_WINDOW;
+        }
+        if (needed_start < retained_start) return false;
+    }
+    return true;
+#else
+    return false;
+#endif
 }
 
 typedef struct {
@@ -7558,6 +7634,70 @@ int sf37_session_common_prefix(sf37_session *s, const sf37_tokens *prompt) {
     int i = 0;
     while (i < n && s->checkpoint.v[i] == prompt->v[i]) i++;
     return i;
+}
+
+static bool session_can_reuse_common(const sf37_session *s,
+                                     const sf37_tokens *prompt,
+                                     int common) {
+    if (!s || !prompt || !s->checkpoint_valid) return false;
+    if (common <= 0 || common > s->checkpoint.len || common > prompt->len) return false;
+    if (common == s->checkpoint.len) return true;
+    if (common == prompt->len) return false;
+    return session_rewind_preserves_kv(s, common);
+}
+
+int sf37_session_reusable_prefix(sf37_session *s, const sf37_tokens *prompt) {
+    if (!s || !prompt || prompt->len > s->ctx_size) return 0;
+    const int common = sf37_session_common_prefix(s, prompt);
+    return session_can_reuse_common(s, prompt, common) ? common : 0;
+}
+
+int sf37_session_reusable_prefix_multimodal(sf37_session *s,
+                                            const sf37_tokens *prompt,
+                                            const sf37_image_features *image_features,
+                                            char *err,
+                                            size_t errlen) {
+    if (!s || !prompt || prompt->len > s->ctx_size) return 0;
+
+    uint32_t image_rows = 0;
+    sf37_image_signature image_sig = {0};
+    if (!session_prepare_image_signature(s, prompt, image_features,
+                                         &image_rows, &image_sig,
+                                         err, errlen)) {
+        return 0;
+    }
+
+    const int common = sf37_session_common_prefix(s, prompt);
+    if (image_rows > 0) {
+        const uint32_t common_image_rows =
+            prompt_count_im_patch(s->engine, prompt, 0, (uint32_t)common);
+        if (common_image_rows > 0 &&
+            !session_image_signature_matches(s, &image_sig)) {
+            return 0;
+        }
+    }
+    return session_can_reuse_common(s, prompt, common) ? common : 0;
+}
+
+int sf37_session_note_image_features(sf37_session *s,
+                                     const sf37_tokens *prompt,
+                                     const sf37_image_features *image_features,
+                                     char *err,
+                                     size_t errlen) {
+    if (!s || !prompt || !image_features) {
+        session_set_err(err, errlen, "invalid image feature note");
+        return 1;
+    }
+
+    uint32_t image_rows = 0;
+    sf37_image_signature image_sig = {0};
+    if (!session_prepare_image_signature(s, prompt, image_features,
+                                         &image_rows, &image_sig,
+                                         err, errlen)) {
+        return 1;
+    }
+    if (image_rows > 0) session_set_image_signature(s, &image_sig);
+    return 0;
 }
 
 int sf37_session_sync_multimodal(sf37_session *s, const sf37_tokens *prompt,
