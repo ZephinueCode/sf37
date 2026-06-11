@@ -4519,6 +4519,10 @@ struct sf37_session {
     void *progress_ud;
     sf37_session_cancel_fn cancel;
     void *cancel_ud;
+    bool image_signature_valid;
+    uint64_t image_signature_a;
+    uint64_t image_signature_b;
+    uint32_t image_signature_rows;
 #ifdef SF37_USE_CUDA
     sf37_cuda_decode_state cuda_state;
     sf37_cuda_prefill_state cuda_prefill;
@@ -4915,6 +4919,133 @@ static bool image_features_effective_rows(const sf37_image_features *features,
     }
     if (rows) *rows = features->rows;
     return true;
+}
+
+typedef struct {
+    uint64_t a;
+    uint64_t b;
+    uint32_t rows;
+} sf37_image_signature;
+
+static void image_signature_update(sf37_image_signature *sig,
+                                   const void *ptr,
+                                   uint64_t bytes) {
+    if (!sig || (!ptr && bytes)) return;
+    const uint8_t *p = ptr;
+    for (uint64_t i = 0; i < bytes; i++) {
+        sig->a ^= (uint64_t)p[i];
+        sig->a *= 1099511628211ull;
+        sig->b ^= ((uint64_t)p[i] << ((i & 7u) * 8u)) ^ (sig->a >> 17);
+        sig->b *= 14029467366897019727ull;
+    }
+}
+
+static void image_signature_u32(sf37_image_signature *sig, uint32_t v) {
+    uint8_t b[4];
+    b[0] = (uint8_t)(v & 255u);
+    b[1] = (uint8_t)((v >> 8) & 255u);
+    b[2] = (uint8_t)((v >> 16) & 255u);
+    b[3] = (uint8_t)((v >> 24) & 255u);
+    image_signature_update(sig, b, sizeof(b));
+}
+
+static bool mul_u64_checked(uint64_t a, uint64_t b, uint64_t *out) {
+    if (a != 0 && b > UINT64_MAX / a) return false;
+    if (out) *out = a * b;
+    return true;
+}
+
+static bool image_signature_from_features(const sf37_image_features *features,
+                                          uint32_t rows,
+                                          sf37_image_signature *out,
+                                          char *err,
+                                          size_t errlen) {
+    if (!out) return false;
+    memset(out, 0, sizeof(*out));
+    if (!features || rows == 0) return true;
+
+    sf37_image_signature sig = {
+        .a = 1469598103934665603ull,
+        .b = 1099511628211ull ^ 0x9e3779b97f4a7c15ull,
+        .rows = rows,
+    };
+    image_signature_u32(&sig, 1u);
+    image_signature_u32(&sig, rows);
+    image_signature_u32(&sig, features->rows);
+    image_signature_u32(&sig, features->dim);
+    image_signature_u32(&sig, features->images);
+    image_signature_u32(&sig, features->pixel_channels);
+    image_signature_u32(&sig, features->pixel_height);
+    image_signature_u32(&sig, features->pixel_width);
+    image_signature_u32(&sig, features->patch_images);
+
+    if (features->patches_per_image && features->images > 0) {
+        image_signature_update(&sig, features->patches_per_image,
+                               (uint64_t)features->images * sizeof(features->patches_per_image[0]));
+    }
+
+    if (features->pixel_values && features->images > 0) {
+        uint64_t n = features->images;
+        if (!mul_u64_checked(n, features->pixel_channels, &n) ||
+            !mul_u64_checked(n, features->pixel_height, &n) ||
+            !mul_u64_checked(n, features->pixel_width, &n) ||
+            n > UINT64_MAX / sizeof(float)) {
+            session_set_err(err, errlen, "image pixel signature overflow");
+            return false;
+        }
+        image_signature_update(&sig, features->pixel_values, n * sizeof(float));
+    }
+
+    if (features->patch_pixel_values && features->patch_images > 0) {
+        uint64_t n = features->patch_images;
+        if (!mul_u64_checked(n, 3u, &n) ||
+            !mul_u64_checked(n, SF37_VISION_PATCH_IMAGE, &n) ||
+            !mul_u64_checked(n, SF37_VISION_PATCH_IMAGE, &n) ||
+            n > UINT64_MAX / sizeof(float)) {
+            session_set_err(err, errlen, "image patch signature overflow");
+            return false;
+        }
+        image_signature_update(&sig, features->patch_pixel_values, n * sizeof(float));
+    }
+
+    if (features->data && features->rows > 0 && features->dim > 0) {
+        uint64_t n = features->rows;
+        if (!mul_u64_checked(n, features->dim, &n) ||
+            n > UINT64_MAX / sizeof(float)) {
+            session_set_err(err, errlen, "image feature signature overflow");
+            return false;
+        }
+        image_signature_update(&sig, features->data, n * sizeof(float));
+    }
+
+    *out = sig;
+    return true;
+}
+
+static bool session_image_signature_matches(const sf37_session *s,
+                                            const sf37_image_signature *sig) {
+    return s && sig &&
+           s->image_signature_valid &&
+           s->image_signature_rows == sig->rows &&
+           s->image_signature_a == sig->a &&
+           s->image_signature_b == sig->b;
+}
+
+static void session_set_image_signature(sf37_session *s,
+                                        const sf37_image_signature *sig) {
+    if (!s || !sig || sig->rows == 0) return;
+    s->image_signature_valid = true;
+    s->image_signature_a = sig->a;
+    s->image_signature_b = sig->b;
+    s->image_signature_rows = sig->rows;
+}
+
+static void session_clear_image_signature(sf37_session *s) {
+    if (!s) return;
+    s->image_signature_valid = false;
+    s->image_signature_a = 0;
+    s->image_signature_b = 0;
+    s->image_signature_rows = 0;
 }
 
 #ifdef SF37_USE_CUDA
@@ -5393,8 +5524,35 @@ static int cuda_prefill_prepare_image_projection(sf37_session *s,
     if (features && features->pixel_values && features->images > 0) {
         return cuda_prefill_prepare_image_pixels(s, features, err, errlen);
     }
-    if (!features || features->rows == 0 || features->dim == SF37_EMBD) return 1;
+    if (!features || features->rows == 0) return 1;
     if (!s || !s->engine || !s->cuda_prefill_ready) return 0;
+    if (features->dim == SF37_EMBD) {
+        const uint64_t out_count = (uint64_t)features->rows * SF37_EMBD;
+        if (!features->data || out_count > UINT64_MAX / sizeof(float)) {
+            session_set_err(err, errlen, "invalid image feature buffer");
+            return 0;
+        }
+        sf37_cuda_prefill_state *p = &s->cuda_prefill;
+        if (p->image_cap < features->rows || p->image_dim != SF37_EMBD ||
+            !p->image_proj) {
+            sf37_cuda_tensor_free(p->image_in);
+            sf37_cuda_tensor_free(p->image_proj);
+            p->image_in = NULL;
+            p->image_proj = sf37_cuda_tensor_alloc(out_count * sizeof(float));
+            p->image_cap = features->rows;
+            p->image_dim = SF37_EMBD;
+            if (!p->image_proj) {
+                session_set_err(err, errlen, "CUDA image feature upload scratch allocation failed");
+                return 0;
+            }
+        }
+        if (!sf37_cuda_tensor_write(p->image_proj, 0, features->data,
+                                    out_count * sizeof(float))) {
+            session_set_err(err, errlen, "CUDA image feature upload failed");
+            return 0;
+        }
+        return 1;
+    }
     if (features->dim != SF37_VISION_PROJECTOR_IN) {
         session_set_err(err, errlen, "unsupported image feature dim %u", features->dim);
         return 0;
@@ -5455,40 +5613,39 @@ static int cuda_prefill_apply_image_features(sf37_session *s,
         return 0;
     }
     uint32_t feature_row = prompt_count_im_patch(e, prompt, 0, pos0);
-    for (uint32_t t = 0; t < n_tok; t++) {
-        if (prompt->v[pos0 + t] != e->vocab.im_patch_id) continue;
-        if (feature_row >= total_rows) {
-            session_set_err(err, errlen, "not enough image feature rows for <im_patch>");
+    const uint32_t chunk_rows = prompt_count_im_patch(e, prompt, pos0, pos0 + n_tok);
+    if (chunk_rows == 0) return 1;
+    if (feature_row > total_rows || chunk_rows > total_rows - feature_row) {
+        session_set_err(err, errlen, "not enough image feature rows for <im_patch>");
+        return 0;
+    }
+    if (!s || !s->cuda_prefill.image_proj) {
+        session_set_err(err, errlen, "CUDA image feature source is not prepared");
+        return 0;
+    }
+    if (!sf37_env_present("SF37_CUDA_NO_IMAGE_SCATTER",
+                          "DS4_CUDA_NO_IMAGE_SCATTER")) {
+        if (!sf37_cuda_scatter_image_features_f32(s->cuda_prefill.hidden,
+                                                  s->cuda_prefill.image_proj,
+                                                  s->cuda_prefill.tokens,
+                                                  n_tok,
+                                                  SF37_EMBD,
+                                                  e->vocab.im_patch_id,
+                                                  feature_row,
+                                                  total_rows)) {
+            session_set_err(err, errlen, "CUDA image feature scatter failed");
             return 0;
         }
+        return 1;
+    }
+    for (uint32_t t = 0; t < n_tok; t++) {
+        if (prompt->v[pos0 + t] != e->vocab.im_patch_id) continue;
         const uint64_t dst_off = (uint64_t)t * SF37_EMBD * sizeof(float);
-        if (features->pixel_values && features->images > 0) {
-            const uint64_t src_off = (uint64_t)feature_row * SF37_EMBD * sizeof(float);
-            if (!s->cuda_prefill.image_proj ||
-                !sf37_cuda_tensor_copy(s->cuda_prefill.hidden, dst_off,
-                                       s->cuda_prefill.image_proj, src_off,
-                                       (uint64_t)SF37_EMBD * sizeof(float))) {
-                session_set_err(err, errlen, "CUDA native image feature copy failed");
-                return 0;
-            }
-        } else if (features->dim == SF37_EMBD) {
-            const float *src = features->data + (uint64_t)feature_row * SF37_EMBD;
-            if (!sf37_cuda_tensor_write(s->cuda_prefill.hidden, dst_off, src,
-                                        (uint64_t)SF37_EMBD * sizeof(float))) {
-                session_set_err(err, errlen, "CUDA image feature row upload failed");
-                return 0;
-            }
-        } else if (features->dim == SF37_VISION_PROJECTOR_IN) {
-            const uint64_t src_off = (uint64_t)feature_row * SF37_EMBD * sizeof(float);
-            if (!s->cuda_prefill.image_proj ||
-                !sf37_cuda_tensor_copy(s->cuda_prefill.hidden, dst_off,
-                                       s->cuda_prefill.image_proj, src_off,
-                                       (uint64_t)SF37_EMBD * sizeof(float))) {
-                session_set_err(err, errlen, "CUDA projected image feature copy failed");
-                return 0;
-            }
-        } else {
-            session_set_err(err, errlen, "unsupported image feature dim %u", features->dim);
+        const uint64_t src_off = (uint64_t)feature_row * SF37_EMBD * sizeof(float);
+        if (!sf37_cuda_tensor_copy(s->cuda_prefill.hidden, dst_off,
+                                   s->cuda_prefill.image_proj, src_off,
+                                   (uint64_t)SF37_EMBD * sizeof(float))) {
+            session_set_err(err, errlen, "CUDA image feature copy failed");
             return 0;
         }
         feature_row++;
@@ -6274,6 +6431,7 @@ static void session_reset(sf37_session *s) {
     if (!s) return;
     s->checkpoint.len = 0;
     s->checkpoint_valid = true;
+    session_clear_image_signature(s);
     if (!session_uses_cuda(s)) {
         for (uint32_t il = 0; il < SF37_MAIN_LAYERS; il++) s->cpu_cache.layer[il].n = 0;
     }
@@ -6798,6 +6956,7 @@ int sf37_session_load_payload(sf37_session *s, FILE *fp, uint64_t payload_bytes,
         snapshot_set_err(err, errlen, "invalid session payload load");
         return 1;
     }
+    session_clear_image_signature(s);
     uint64_t remaining = payload_bytes;
     uint32_t h[SF37_SESSION_PAYLOAD_U32_FIELDS];
     for (uint32_t i = 0; i < SF37_SESSION_PAYLOAD_U32_FIELDS; i++) {
@@ -7106,6 +7265,7 @@ int sf37_session_load_snapshot(sf37_session *s, const sf37_session_snapshot *sna
         snapshot_set_err(err, errlen, "invalid session snapshot load");
         return 1;
     }
+    session_clear_image_signature(s);
     sf37_snapshot_reader r = { .p = snap->ptr, .len = snap->len, .pos = 0 };
     uint32_t h[SF37_SESSION_SNAPSHOT_U32_FIELDS];
     for (uint32_t i = 0; i < SF37_SESSION_SNAPSHOT_U32_FIELDS; i++) {
@@ -7426,8 +7586,16 @@ int sf37_session_sync_multimodal(sf37_session *s, const sf37_tokens *prompt,
             return 1;
         }
     }
+    sf37_image_signature image_sig = {0};
+    const bool has_image_sig = image_rows > 0;
+    if (has_image_sig &&
+        !image_signature_from_features(image_features, image_rows, &image_sig,
+                                       err, errlen)) {
+        return 1;
+    }
+
     int common = sf37_session_common_prefix(s, prompt);
-    if (image_rows > 0) {
+    if (has_image_sig && !session_image_signature_matches(s, &image_sig)) {
         session_reset(s);
         common = 0;
     } else if (!s->checkpoint_valid || common == 0 || common < s->checkpoint.len) {
@@ -7436,22 +7604,33 @@ int sf37_session_sync_multimodal(sf37_session *s, const sf37_tokens *prompt,
     } else if (common < prompt->len) {
         sf37_session_rewind(s, common);
     }
+    uint32_t suffix_image_rows = 0;
+    if (image_rows > 0) {
+        suffix_image_rows = prompt_count_im_patch(s->engine, prompt,
+                                                  (uint32_t)common,
+                                                  (uint32_t)prompt->len);
+    }
 #ifdef SF37_USE_CUDA
     if (session_uses_cuda(s)) {
+        const sf37_image_features *prefill_image_features =
+            suffix_image_rows > 0 ? image_features : NULL;
         const int suffix = prompt->len - common;
         const uint32_t resume_min = cuda_resume_prefill_min_tokens();
         if (!cuda_batch_prefill_disabled() && suffix > 0 && (uint32_t)suffix >= resume_min) {
             const int rc = cuda_prefill_chunked_range(s, prompt, (uint32_t)common,
-                                                      (uint32_t)suffix, image_features,
+                                                      (uint32_t)suffix, prefill_image_features,
                                                       err, errlen);
-            if (rc > 0) return 0;
-            if (rc < 0 || image_features) return 1;
+            if (rc > 0) {
+                if (has_image_sig) session_set_image_signature(s, &image_sig);
+                return 0;
+            }
+            if (rc < 0 || prefill_image_features) return 1;
         }
         cuda_prefill_prepare_q8_cache(s->engine, s->progress, s->progress_ud,
                                       common, prompt->len);
     }
 #endif
-    if (image_features && image_rows > 0) {
+    if (suffix_image_rows > 0) {
         session_set_err(err, errlen, "multimodal session sync requires CUDA batch prefill");
         return 1;
     }
@@ -7468,6 +7647,7 @@ int sf37_session_sync_multimodal(sf37_session *s, const sf37_tokens *prompt,
             return 1;
         }
     }
+    if (has_image_sig) session_set_image_signature(s, &image_sig);
     return 0;
 }
 
