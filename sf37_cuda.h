@@ -56,6 +56,13 @@ int sf37_cuda_embed_tokens_bf16_mapped(sf37_cuda_tensor *out,
                                         uint64_t vocab,
                                         const sf37_cuda_tensor *tokens,
                                         uint32_t n_tok);
+int sf37_cuda_embed_token_bf16_mapped(sf37_cuda_tensor *out,
+                                       const void *model_map,
+                                       uint64_t model_size,
+                                       uint64_t weight_offset,
+                                       uint64_t dim,
+                                       uint64_t vocab,
+                                       int32_t token);
 
 int sf37_cuda_rms_norm_weight1_f32(sf37_cuda_tensor *out,
                                    const sf37_cuda_tensor *x,
