@@ -1896,6 +1896,73 @@ extern "C" int sf37_cuda_embed_tokens_bf16_mapped(sf37_cuda_tensor *out,
     return cuda_ok(cudaGetLastError(), "embed_tokens_bf16 mapped launch");
 }
 
+__global__ static void scatter_image_features_f32_kernel(float *hidden,
+                                                         const float *features,
+                                                         const int32_t *tokens,
+                                                         uint32_t n_tok,
+                                                         uint32_t dim,
+                                                         int32_t im_patch_id,
+                                                         uint32_t start_feature_row,
+                                                         uint32_t total_feature_rows) {
+    const uint32_t t = blockIdx.x;
+    if (t >= n_tok || tokens[t] != im_patch_id) return;
+
+    __shared__ uint32_t src_row_sh;
+    if (threadIdx.x == 0) {
+        uint32_t local_row = 0;
+        for (uint32_t i = 0; i < t; i++) {
+            if (tokens[i] == im_patch_id) local_row++;
+        }
+        src_row_sh = start_feature_row + local_row;
+    }
+    __syncthreads();
+
+    const uint32_t src_row = src_row_sh;
+    if (src_row >= total_feature_rows) return;
+
+    float *dst = hidden + (uint64_t)t * dim;
+    const float *src = features + (uint64_t)src_row * dim;
+    for (uint32_t d = threadIdx.x; d < dim; d += blockDim.x) {
+        dst[d] = src[d];
+    }
+}
+
+extern "C" int sf37_cuda_scatter_image_features_f32(sf37_cuda_tensor *hidden,
+                                                     const sf37_cuda_tensor *features,
+                                                     const sf37_cuda_tensor *tokens,
+                                                     uint32_t n_tok,
+                                                     uint32_t dim,
+                                                     int32_t im_patch_id,
+                                                     uint32_t start_feature_row,
+                                                     uint32_t total_feature_rows) {
+    if (!hidden || !features || !tokens || n_tok == 0 || dim == 0 ||
+        im_patch_id < 0 || total_feature_rows == 0 ||
+        start_feature_row >= total_feature_rows) {
+        return 0;
+    }
+    if (n_tok > UINT64_MAX / dim / sizeof(float) ||
+        total_feature_rows > UINT64_MAX / dim / sizeof(float)) {
+        return 0;
+    }
+    const uint64_t hidden_bytes = (uint64_t)n_tok * dim * sizeof(float);
+    const uint64_t feature_bytes = (uint64_t)total_feature_rows * dim * sizeof(float);
+    if (hidden->bytes < hidden_bytes ||
+        features->bytes < feature_bytes ||
+        tokens->bytes < (uint64_t)n_tok * sizeof(int32_t)) {
+        return 0;
+    }
+    scatter_image_features_f32_kernel<<<(unsigned)n_tok, 256>>>(
+            (float *)hidden->ptr,
+            (const float *)features->ptr,
+            (const int32_t *)tokens->ptr,
+            n_tok,
+            dim,
+            im_patch_id,
+            start_feature_row,
+            total_feature_rows);
+    return cuda_ok(cudaGetLastError(), "scatter image features f32 launch");
+}
+
 __device__ static float warp_sum_f32(float v) {
     for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xffffffffu, v, off);
     return v;
