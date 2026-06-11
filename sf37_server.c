@@ -2533,6 +2533,29 @@ static char *render_chat_prompt_text(sf37_engine *e, const chat_msgs *msgs,
     return buf_take(&out);
 }
 
+static bool rendered_prompt_preserves_reasoning(const chat_msgs *msgs,
+                                                sf37_think_mode think_mode) {
+    if (!msgs || think_mode != SF37_THINK_ENABLED) return false;
+    int last_query_idx = msgs->len - 1;
+    for (int i = msgs->len - 1; i >= 0; i--) {
+        if (message_is_plain_user_query(&msgs->v[i])) {
+            last_query_idx = i;
+            break;
+        }
+    }
+    for (int i = 0; i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        const char *role = m->role ? m->role : "user";
+        if (!strcmp(role, "assistant") &&
+            i > last_query_idx &&
+            m->reasoning &&
+            m->reasoning[0]) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void request_finish_prompt(sf37_engine *e, request *r, const chat_msgs *msgs,
                                   const char *tool_schemas) {
     const char *active_tools = r->has_tools ? tool_schemas : NULL;
@@ -3038,14 +3061,10 @@ static bool parse_chat_request(sf37_engine *e, server_state *s, const char *body
     r->think_mode = thinking_enabled ? SF37_THINK_ENABLED : SF37_THINK_NONE;
     r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
     request_normalize_generation(r);
-    for (int i = 0; i < msgs.len; i++) {
-        if (msgs.v[i].reasoning && msgs.v[i].reasoning[0]) {
-            r->prompt_preserves_reasoning = true;
-            break;
-        }
-    }
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
+    r->prompt_preserves_reasoning =
+        rendered_prompt_preserves_reasoning(&msgs, r->think_mode);
     request_finish_prompt(e, r, &msgs, tool_schemas);
     request_take_multimodal(r, &mm);
     chat_msgs_free(&msgs);
@@ -3594,12 +3613,6 @@ static bool parse_anthropic_request(sf37_engine *e, server_state *s,
     r->think_mode = thinking_enabled ? SF37_THINK_ENABLED : SF37_THINK_NONE;
     r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
     request_normalize_generation(r);
-    for (int i = 0; i < msgs.len; i++) {
-        if (msgs.v[i].reasoning && msgs.v[i].reasoning[0]) {
-            r->prompt_preserves_reasoning = true;
-            break;
-        }
-    }
     if (!anthropic_validate_tool_results(s, &msgs,
                                          &r->anthropic_requires_live_tool_state,
                                          err, errlen)) {
@@ -3612,6 +3625,8 @@ static bool parse_anthropic_request(sf37_engine *e, server_state *s,
     }
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
+    r->prompt_preserves_reasoning =
+        rendered_prompt_preserves_reasoning(&msgs, r->think_mode);
     anthropic_prepare_live_continuation(r, e, &msgs);
     request_finish_prompt(e, r, &msgs, tool_schemas);
     request_take_multimodal(r, &mm);
@@ -4136,12 +4151,6 @@ static bool parse_responses_request(sf37_engine *e, server_state *s,
         (!tool_choice_none && combined_tool_schemas.len) ?
         combined_tool_schemas.ptr : NULL;
     r->has_tools = active_tool_schemas && active_tool_schemas[0];
-    for (int i = 0; i < msgs.len; i++) {
-        if (msgs.v[i].reasoning && msgs.v[i].reasoning[0]) {
-            r->prompt_preserves_reasoning = true;
-            break;
-        }
-    }
     if (!responses_validate_tool_outputs(s, &msgs, r->think_mode,
                                          &r->responses_requires_live_tool_state,
                                          &r->responses_requires_live_reasoning,
@@ -4157,6 +4166,8 @@ static bool parse_responses_request(sf37_engine *e, server_state *s,
     }
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
+    r->prompt_preserves_reasoning =
+        rendered_prompt_preserves_reasoning(&msgs, r->think_mode);
     responses_prepare_live_continuation(r, e, &msgs);
     request_finish_prompt(e, r, &msgs, active_tool_schemas);
     request_take_multimodal(r, &mm);
@@ -7424,8 +7435,27 @@ static int run_generation(server_state *s, int fd, request *r) {
         return 1;
     }
     if (!has_images && cached == 0) {
-        cached = sf37_session_common_prefix(s->session, &prompt);
-        if (cached != old_pos || cached == 0) cached = 0;
+        cached = sf37_session_reusable_prefix(s->session, &prompt);
+        if (cached > 0 && cached < old_pos) {
+            fprintf(stderr, "sf37-server: live token-prefix rewind cached=%d live=%d prompt=%d\n",
+                    cached, old_pos, prompt.len);
+        }
+    }
+    if (has_images && cached == 0 &&
+        s->current_session_has_images &&
+        s->current_image_cache_header &&
+        image_cache_header &&
+        strcmp(s->current_image_cache_header, image_cache_header) == 0 &&
+        old_pos > 0 &&
+        (s->current_image_store_min_tokens <= 0 ||
+         old_pos >= s->current_image_store_min_tokens)) {
+        cached = sf37_session_reusable_prefix_multimodal(s->session, &prompt,
+                                                         &r->image_features,
+                                                         NULL, 0);
+        if (cached > 0) {
+            fprintf(stderr, "sf37-server: live image-prefix continuation cached=%d prompt=%d\n",
+                    cached, prompt.len);
+        }
     }
     if (!has_images && cached == 0) {
         int thinking_cached =
@@ -7484,6 +7514,16 @@ static int run_generation(server_state *s, int fd, request *r) {
                 sf37_tokens_free(&prompt);
                 prompt = cached_prompt;
                 cached = loaded;
+                if (has_images && (cache_hit.ext_flags & KV_EXT_IMAGE_KEY)) {
+                    char sig_err[160] = {0};
+                    if (sf37_session_note_image_features(s->session, &prompt,
+                                                         &r->image_features,
+                                                         sig_err, sizeof(sig_err)) != 0) {
+                        fprintf(stderr, "sf37-server: image kv disk cache signature note failed: %s\n",
+                                sig_err[0] ? sig_err : "unknown error");
+                        cached = 0;
+                    }
+                }
                 fprintf(stderr, "sf37-server: kv disk cache hit tokens=%d load=%.1fms file=%s\n",
                         loaded, cache_hit.load_ms, cache_hit.path ? cache_hit.path : "?");
             }
@@ -7614,8 +7654,8 @@ static int run_generation(server_state *s, int fd, request *r) {
         sf37_tokens_free(&prefix);
     }
 
-    const bool need_image_features = has_images && cached == 0;
-    if ((need_image_features
+    const bool use_image_features = has_images;
+    if ((use_image_features
             ? sf37_session_sync_multimodal(s->session, &prompt,
                                            &r->image_features,
                                            err, sizeof(err))
