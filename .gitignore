@@ -1,0 +1,8 @@
+*.o
+sf37
+sf37-bench
+sf37-server
+tests/*.o
+tests/test_sf37_quant
+tests/test_sf37_ops
+tests/test_sf37_cuda_ops
