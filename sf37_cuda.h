@@ -63,6 +63,14 @@ int sf37_cuda_embed_token_bf16_mapped(sf37_cuda_tensor *out,
                                        uint64_t dim,
                                        uint64_t vocab,
                                        int32_t token);
+int sf37_cuda_scatter_image_features_f32(sf37_cuda_tensor *hidden,
+                                         const sf37_cuda_tensor *features,
+                                         const sf37_cuda_tensor *tokens,
+                                         uint32_t n_tok,
+                                         uint32_t dim,
+                                         int32_t im_patch_id,
+                                         uint32_t start_feature_row,
+                                         uint32_t total_feature_rows);
 
 int sf37_cuda_rms_norm_weight1_f32(sf37_cuda_tensor *out,
                                    const sf37_cuda_tensor *x,
