@@ -1702,6 +1702,52 @@ extern "C" sf37_cuda_tensor *sf37_cuda_tensor_alloc(uint64_t bytes) {
     return t;
 }
 
+extern "C" sf37_cuda_tensor *sf37_cuda_tensor_alloc_managed(uint64_t bytes) {
+    if (bytes == 0) bytes = 1;
+    sf37_cuda_tensor *t = (sf37_cuda_tensor *)calloc(1, sizeof(*t));
+    if (!t) return NULL;
+    if (!cuda_ok(cudaMallocManaged(&t->ptr, (size_t)bytes), "managed tensor alloc")) {
+        free(t);
+        return NULL;
+    }
+    t->bytes = bytes;
+    return t;
+}
+
+static uint64_t cuda_managed_kv_reserve_bytes(uint64_t total_bytes) {
+    const uint64_t min_reserve = 8ull * 1073741824ull;
+    const uint64_t max_reserve = 40ull * 1073741824ull;
+    uint64_t reserve = total_bytes / 4u;
+    if (reserve < min_reserve) reserve = min_reserve;
+    if (reserve > max_reserve) reserve = max_reserve;
+    return reserve;
+}
+
+extern "C" int sf37_cuda_should_use_managed_kv_cache(uint64_t kv_cache_bytes,
+                                                      uint64_t context_bytes) {
+    if (kv_cache_bytes == 0) return 0;
+
+    const uint64_t huge_kv = 8ull * 1073741824ull;
+    if (kv_cache_bytes >= huge_kv) return 1;
+
+    const uint64_t large_context = 8ull * 1073741824ull;
+    if (context_bytes < large_context) return 0;
+
+    size_t free_b = 0;
+    size_t total_b = 0;
+    cudaError_t err = cudaMemGetInfo(&free_b, &total_b);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+
+    const uint64_t free_bytes = (uint64_t)free_b;
+    const uint64_t total_bytes = (uint64_t)total_b;
+    const uint64_t reserve_bytes = cuda_managed_kv_reserve_bytes(total_bytes);
+    if (context_bytes > free_bytes) return 1;
+    return free_bytes - context_bytes < reserve_bytes;
+}
+
 extern "C" void sf37_cuda_tensor_free(sf37_cuda_tensor *tensor) {
     if (!tensor) return;
     if (tensor->ptr) (void)cudaFree(tensor->ptr);
@@ -2223,6 +2269,135 @@ __global__ static void attention_decode_heads128_warp_kernel(float *out_heads,
     oh[lane + 96u] = o3 * inv * gate;
 }
 
+__global__ static void attention_decode_heads_at_kernel(float *out_heads,
+                                                        const float *q,
+                                                        const float *k_cache,
+                                                        const float *v_cache,
+                                                        const float *head_gate,
+                                                        uint32_t pos,
+                                                        uint32_t cache_cap,
+                                                        uint32_t q_heads,
+                                                        uint32_t kv_heads,
+                                                        uint32_t head_dim,
+                                                        int sliding,
+                                                        uint32_t window) {
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t n = (uint64_t)q_heads * head_dim;
+    if (gid >= n || cache_cap == 0) return;
+    const uint32_t h = (uint32_t)(gid / head_dim);
+    const uint32_t d = (uint32_t)(gid - (uint64_t)h * head_dim);
+    const uint32_t repeat = q_heads / kv_heads;
+    const uint32_t kvh = h / repeat;
+    const uint64_t kv_row = (uint64_t)kv_heads * head_dim;
+    const float *qh = q + (uint64_t)h * head_dim;
+    const uint32_t have = pos + 1u;
+    uint32_t start = 0;
+    if (have > cache_cap) start = have - cache_cap;
+    if (sliding && have > window) {
+        const uint32_t sw = have - window;
+        if (sw > start) start = sw;
+    }
+
+    float max_score = -INFINITY;
+    for (uint32_t r = start; r <= pos; r++) {
+        const uint32_t row = r % cache_cap;
+        const float *kh = k_cache + (uint64_t)row * kv_row + (uint64_t)kvh * head_dim;
+        float score = 0.0f;
+        for (uint32_t i = 0; i < head_dim; i++) score += qh[i] * kh[i];
+        score *= rsqrtf((float)head_dim);
+        if (score > max_score) max_score = score;
+    }
+
+    float denom = 0.0f;
+    float acc = 0.0f;
+    for (uint32_t r = start; r <= pos; r++) {
+        const uint32_t row = r % cache_cap;
+        const float *kh = k_cache + (uint64_t)row * kv_row + (uint64_t)kvh * head_dim;
+        const float *vh = v_cache + (uint64_t)row * kv_row + (uint64_t)kvh * head_dim;
+        float score = 0.0f;
+        for (uint32_t i = 0; i < head_dim; i++) score += qh[i] * kh[i];
+        score *= rsqrtf((float)head_dim);
+        const float w = expf(score - max_score);
+        denom += w;
+        acc += w * vh[d];
+    }
+    const float inv = denom > 0.0f ? 1.0f / denom : 0.0f;
+    out_heads[gid] = acc * inv * sf37_sigmoid_dev(head_gate[h]);
+}
+
+__global__ static void attention_decode_heads128_warp_at_kernel(float *out_heads,
+                                                                const float *q,
+                                                                const float *k_cache,
+                                                                const float *v_cache,
+                                                                const float *head_gate,
+                                                                uint32_t pos,
+                                                                uint32_t cache_cap,
+                                                                uint32_t q_heads,
+                                                                uint32_t kv_heads,
+                                                                int sliding,
+                                                                uint32_t window) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t h = blockIdx.x * 8u + warp;
+    if (h >= q_heads || cache_cap == 0) return;
+
+    const uint32_t repeat = q_heads / kv_heads;
+    const uint32_t kvh = h / repeat;
+    const uint64_t kv_row = (uint64_t)kv_heads * 128u;
+    const float *qh = q + (uint64_t)h * 128u;
+    const float q0 = qh[lane + 0u];
+    const float q1 = qh[lane + 32u];
+    const float q2 = qh[lane + 64u];
+    const float q3 = qh[lane + 96u];
+    const float scale = rsqrtf(128.0f);
+    const uint32_t have = pos + 1u;
+    uint32_t start = 0;
+    if (have > cache_cap) start = have - cache_cap;
+    if (sliding && have > window) {
+        const uint32_t sw = have - window;
+        if (sw > start) start = sw;
+    }
+
+    float max_s = -INFINITY;
+    float sum_s = 0.0f;
+    float o0 = 0.0f;
+    float o1 = 0.0f;
+    float o2 = 0.0f;
+    float o3 = 0.0f;
+    const unsigned mask = 0xffffffffu;
+
+    for (uint32_t r = start; r <= pos; r++) {
+        const uint32_t row = r % cache_cap;
+        const float *kh = k_cache + (uint64_t)row * kv_row + (uint64_t)kvh * 128u;
+        const float *vh = v_cache + (uint64_t)row * kv_row + (uint64_t)kvh * 128u;
+        float dot = q0 * kh[lane + 0u] +
+                    q1 * kh[lane + 32u] +
+                    q2 * kh[lane + 64u] +
+                    q3 * kh[lane + 96u];
+        dot = warp_sum_f32(dot);
+        const float score = __shfl_sync(mask, dot, 0) * scale;
+
+        const float old_m = max_s;
+        const float new_m = fmaxf(max_s, score);
+        const float old_scale = expf(old_m - new_m);
+        const float row_scale = expf(score - new_m);
+        sum_s = sum_s * old_scale + row_scale;
+        o0 = o0 * old_scale + row_scale * vh[lane + 0u];
+        o1 = o1 * old_scale + row_scale * vh[lane + 32u];
+        o2 = o2 * old_scale + row_scale * vh[lane + 64u];
+        o3 = o3 * old_scale + row_scale * vh[lane + 96u];
+        max_s = new_m;
+    }
+
+    const float gate = sf37_sigmoid_dev(head_gate[h]);
+    const float inv = sum_s > 0.0f ? 1.0f / sum_s : 0.0f;
+    float *oh = out_heads + (uint64_t)h * 128u;
+    oh[lane + 0u] = o0 * inv * gate;
+    oh[lane + 32u] = o1 * inv * gate;
+    oh[lane + 64u] = o2 * inv * gate;
+    oh[lane + 96u] = o3 * inv * gate;
+}
+
 extern "C" int sf37_cuda_attention_decode_heads(sf37_cuda_tensor *out_heads,
                                                  const sf37_cuda_tensor *q,
                                                  const sf37_cuda_tensor *k_cache,
@@ -2262,6 +2437,50 @@ extern "C" int sf37_cuda_attention_decode_heads(sf37_cuda_tensor *out_heads,
             (const float *)head_gate->ptr,
             n_cache, cache_cap, q_heads, kv_heads, head_dim, sliding, window);
     return cuda_ok(cudaGetLastError(), "attention_decode_heads launch");
+}
+
+extern "C" int sf37_cuda_attention_decode_heads_at(sf37_cuda_tensor *out_heads,
+                                                    const sf37_cuda_tensor *q,
+                                                    const sf37_cuda_tensor *k_cache,
+                                                    const sf37_cuda_tensor *v_cache,
+                                                    const sf37_cuda_tensor *head_gate,
+                                                    uint32_t pos,
+                                                    uint32_t cache_cap,
+                                                    uint32_t q_heads,
+                                                    uint32_t kv_heads,
+                                                    uint32_t head_dim,
+                                                    int sliding,
+                                                    uint32_t window) {
+    if (!out_heads || !q || !k_cache || !v_cache || !head_gate ||
+        cache_cap == 0 || kv_heads == 0 || q_heads % kv_heads != 0 ||
+        head_dim == 0) {
+        return 0;
+    }
+    const uint64_t q_dim = (uint64_t)q_heads * head_dim;
+    const uint64_t kv_dim = (uint64_t)kv_heads * head_dim;
+    if (out_heads->bytes < q_dim * sizeof(float) ||
+        q->bytes < q_dim * sizeof(float) ||
+        k_cache->bytes < (uint64_t)cache_cap * kv_dim * sizeof(float) ||
+        v_cache->bytes < (uint64_t)cache_cap * kv_dim * sizeof(float) ||
+        head_gate->bytes < (uint64_t)q_heads * sizeof(float)) return 0;
+    if (head_dim == 128u && !cuda_env_present("SF37_CUDA_NO_WARP_ATTENTION", NULL)) {
+        attention_decode_heads128_warp_at_kernel<<<(unsigned)((q_heads + 7u) / 8u), 256>>>(
+                (float *)out_heads->ptr,
+                (const float *)q->ptr,
+                (const float *)k_cache->ptr,
+                (const float *)v_cache->ptr,
+                (const float *)head_gate->ptr,
+                pos, cache_cap, q_heads, kv_heads, sliding, window);
+        return cuda_ok(cudaGetLastError(), "attention_decode_heads128_at warp launch");
+    }
+    attention_decode_heads_at_kernel<<<(unsigned)((q_dim + 255u) / 256u), 256>>>(
+            (float *)out_heads->ptr,
+            (const float *)q->ptr,
+            (const float *)k_cache->ptr,
+            (const float *)v_cache->ptr,
+            (const float *)head_gate->ptr,
+            pos, cache_cap, q_heads, kv_heads, head_dim, sliding, window);
+    return cuda_ok(cudaGetLastError(), "attention_decode_heads_at launch");
 }
 
 __global__ static void attention_prefill_heads128_warp_kernel(float *out_heads,
@@ -2390,8 +2609,6 @@ extern "C" int sf37_cuda_attention_prefill_heads(sf37_cuda_tensor *out_heads,
 
     for (uint32_t t = 0; t < n_tok; t++) {
         const uint32_t pos = pos0 + t;
-        uint32_t n_cache = pos + 1u;
-        if (n_cache > cache_cap) n_cache = cache_cap;
         sf37_cuda_tensor out_view = {
             (char *)out_heads->ptr + (uint64_t)t * q_dim * sizeof(float),
             q_dim * sizeof(float)
@@ -2404,18 +2621,18 @@ extern "C" int sf37_cuda_attention_prefill_heads(sf37_cuda_tensor *out_heads,
             (char *)head_gate->ptr + (uint64_t)t * q_heads * sizeof(float),
             (uint64_t)q_heads * sizeof(float)
         };
-        if (!sf37_cuda_attention_decode_heads(&out_view,
-                                              &q_view,
-                                              k_cache,
-                                              v_cache,
-                                              &gate_view,
-                                              n_cache,
-                                              cache_cap,
-                                              q_heads,
-                                              kv_heads,
-                                              head_dim,
-                                              sliding,
-                                              window)) {
+        if (!sf37_cuda_attention_decode_heads_at(&out_view,
+                                                 &q_view,
+                                                 k_cache,
+                                                 v_cache,
+                                                 &gate_view,
+                                                 pos,
+                                                 cache_cap,
+                                                 q_heads,
+                                                 kv_heads,
+                                                 head_dim,
+                                                 sliding,
+                                                 window)) {
             return 0;
         }
     }
