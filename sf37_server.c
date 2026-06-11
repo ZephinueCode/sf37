@@ -146,6 +146,14 @@ static long long wall_ms(void) {
     return (long long)((double)clock() * 1000.0 / (double)CLOCKS_PER_SEC);
 }
 
+static double now_sec(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
+        return (double)ts.tv_sec + (double)ts.tv_nsec * 1.0e-9;
+    }
+    return (double)clock() / (double)CLOCKS_PER_SEC;
+}
+
 static bool send_all(int fd, const void *p, size_t n) {
     const char *s = p;
     long long deadline = wall_ms() + SF37_SERVER_SEND_STALL_TIMEOUT_MS;
@@ -6487,6 +6495,65 @@ static bool server_session_cancel(void *ud) {
     return server_stop_requested();
 }
 
+static const char *generation_kind(api_style api) {
+    return api == API_COMPLETIONS ? "completion" : "chat";
+}
+
+static void request_ctx_span(char *buf, size_t len, int cached, int prompt) {
+    int suffix = prompt - cached;
+    if (suffix < 0) suffix = 0;
+    snprintf(buf, len, "%d..%d:%d", cached, prompt, suffix);
+}
+
+static void log_flag_append(char *buf, size_t len, const char *name) {
+    size_t used = strlen(buf);
+    if (used >= len) return;
+    snprintf(buf + used, len - used, "%s%s", used ? " " : "", name);
+}
+
+static void log_decode_flags(char *buf, size_t len, api_style api,
+                             bool tools, bool thinking,
+                             bool dsml_start, bool dsml_end) {
+    buf[0] = 0;
+    if (api == API_RESPONSES) log_flag_append(buf, len, "RESPPROTO");
+    else if (api == API_ANTHROPIC) log_flag_append(buf, len, "ANTHROPIC");
+    if (tools) log_flag_append(buf, len, "TOOLS");
+    if (thinking) log_flag_append(buf, len, "THINKING");
+    if (dsml_start) log_flag_append(buf, len, "DSML_START");
+    if (dsml_end) log_flag_append(buf, len, "DSML_END");
+}
+
+static void log_decode_progress(api_style api, int prompt_tokens, int completion,
+                                bool tools, bool thinking,
+                                bool dsml_start, bool dsml_end,
+                                double decode_t0,
+                                double *last_t, int *last_completion) {
+    const double now = now_sec();
+    const double elapsed = now - decode_t0;
+    const double interval_s = now - *last_t;
+    const int interval_tokens = completion - *last_completion;
+    const double chunk_tps = interval_s > 0.0 ? (double)interval_tokens / interval_s : 0.0;
+    const double avg_tps = elapsed > 0.0 ? (double)completion / elapsed : 0.0;
+    char ctx[48];
+    char flags[80];
+    request_ctx_span(ctx, sizeof(ctx),
+                     prompt_tokens + *last_completion,
+                     prompt_tokens + completion);
+    log_decode_flags(flags, sizeof(flags), api, tools, thinking, dsml_start, dsml_end);
+    fprintf(stderr,
+            "sf37-server: %s ctx=%s gen=%d%s%s decoding chunk=%.2f t/s avg=%.2f t/s %.3fs\n",
+            generation_kind(api),
+            ctx,
+            completion,
+            flags[0] ? " " : "",
+            flags,
+            chunk_tps,
+            avg_tps,
+            elapsed);
+    *last_t = now;
+    *last_completion = completion;
+}
+
 static void random_prefixed_id(char *dst, size_t dstlen, const char *prefix) {
     static const char hex[] = "0123456789abcdef";
     static uint64_t ctr;
@@ -7667,6 +7734,10 @@ static int run_generation(server_state *s, int fd, request *r) {
     size_t stop_scan_from = 0;
     bool saw_tool_start = false;
     bool saw_tool_end = false;
+    const double decode_t0 = now_sec();
+    double last_decode_log_t = decode_t0;
+    int last_decode_log_completion = 0;
+    int next_decode_log = 50;
 
     int greedy_token = -1;
     if (r->temperature <= 0.0f && r->max_tokens > 0) {
@@ -7792,12 +7863,32 @@ static int run_generation(server_state *s, int fd, request *r) {
                 break;
             }
         }
+        if (completion_tokens >= next_decode_log) {
+            log_decode_progress(r->api, prompt.len, completion_tokens,
+                                r->has_tools,
+                                r->think_mode == SF37_THINK_ENABLED,
+                                saw_tool_start, saw_tool_end,
+                                decode_t0,
+                                &last_decode_log_t,
+                                &last_decode_log_completion);
+            next_decode_log += 50;
+        }
         if (tool_end_after_eval) break;
         if (sf37_session_pos(s->session) >= sf37_session_ctx(s->session)) {
             finish = "length";
             break;
         }
     }
+    if (completion_tokens > last_decode_log_completion) {
+        log_decode_progress(r->api, prompt.len, completion_tokens,
+                            r->has_tools,
+                            r->think_mode == SF37_THINK_ENABLED,
+                            saw_tool_start, saw_tool_end,
+                            decode_t0,
+                            &last_decode_log_t,
+                            &last_decode_log_completion);
+    }
+
     if (completion_tokens >= r->max_tokens && r->max_tokens > 0 &&
         !strcmp(finish, "stop")) {
         finish = "length";
