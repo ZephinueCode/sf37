@@ -143,6 +143,13 @@ int sf37_session_sync_multimodal(sf37_session *s, const sf37_tokens *prompt,
                                  char *err, size_t errlen);
 void sf37_session_rewind(sf37_session *s, int pos);
 int sf37_session_common_prefix(sf37_session *s, const sf37_tokens *prompt);
+int sf37_session_reusable_prefix(sf37_session *s, const sf37_tokens *prompt);
+int sf37_session_reusable_prefix_multimodal(sf37_session *s, const sf37_tokens *prompt,
+                                            const sf37_image_features *image_features,
+                                            char *err, size_t errlen);
+int sf37_session_note_image_features(sf37_session *s, const sf37_tokens *prompt,
+                                     const sf37_image_features *image_features,
+                                     char *err, size_t errlen);
 uint64_t sf37_session_snapshot_bytes(sf37_session *s);
 uint64_t sf37_session_payload_bytes(sf37_session *s);
 int sf37_session_stage_payload(sf37_session *s, sf37_session_payload_file *out, char *err, size_t errlen);
