@@ -3292,7 +3292,6 @@ static int cuda_decode_layer(sf37_engine *e, sf37_cuda_decode_state *s,
     const double theta = layer_rope_theta(il);
     const int full = layer_is_full(il) ? 1 : 0;
     const uint32_t cache_cap = s->cache_cap[il] ? s->cache_cap[il] : 1u;
-    const uint32_t cache_slot = pos % cache_cap;
     int ok = 1;
     (void)sf37_cuda_begin_layer(il);
     cuda_preload_layer_weights(e, il);
@@ -3336,10 +3335,10 @@ static int cuda_decode_layer(sf37_engine *e, sf37_cuda_decode_state *s,
                                                rotary_dim, theta, full, pos), "q rope");
     CUDA_LAYER_CHECK(sf37_cuda_rope_split_half(s->k, SF37_KV_HEADS, SF37_HEAD_DIM,
                                                rotary_dim, theta, full, pos), "k rope");
-    CUDA_LAYER_CHECK(sf37_cuda_tensor_copy(s->k_cache[il], (uint64_t)cache_slot * kv_dim * sizeof(float),
-                                           s->k, 0, (uint64_t)kv_dim * sizeof(float)), "k cache store");
-    CUDA_LAYER_CHECK(sf37_cuda_tensor_copy(s->v_cache[il], (uint64_t)cache_slot * kv_dim * sizeof(float),
-                                           s->v, 0, (uint64_t)kv_dim * sizeof(float)), "v cache store");
+    CUDA_LAYER_CHECK(sf37_cuda_store_kv_cache_batch(s->k_cache[il], s->v_cache[il],
+                                                    s->k, s->v, pos, 1u,
+                                                    cache_cap, kv_dim),
+                     "kv cache store");
     CUDA_LAYER_CHECK(sf37_cuda_attention_decode_heads_at(s->attn_heads, s->q,
                                                          s->k_cache[il], s->v_cache[il],
                                                          s->head_gate,
@@ -7259,13 +7258,17 @@ static int sf37_session_eval_internal(sf37_session *s, int token, bool need_logi
     }
     sf37_engine *e = s->engine;
     const uint32_t pos = (uint32_t)s->checkpoint.len;
-    embed_token_bf16(e, token, s->hidden);
 
     if (session_uses_cuda(s)) {
 #ifdef SF37_USE_CUDA
-        const uint64_t embd_bytes = (uint64_t)SF37_EMBD * sizeof(float);
-        if (!sf37_cuda_tensor_write(s->cuda_state.hidden, 0, s->hidden, embd_bytes)) {
-            session_set_err(err, errlen, "CUDA hidden upload failed");
+        if (!sf37_cuda_embed_token_bf16_mapped(s->cuda_state.hidden,
+                                               e->gguf.map,
+                                               e->gguf.size,
+                                               e->embed_tokens->abs_offset,
+                                               SF37_EMBD,
+                                               SF37_VOCAB,
+                                               (int32_t)token)) {
+            session_set_err(err, errlen, "CUDA token embedding failed");
             s->checkpoint_valid = false;
             return 1;
         }
@@ -7287,6 +7290,7 @@ static int sf37_session_eval_internal(sf37_session *s, int token, bool need_logi
         }
 #endif
     } else {
+        embed_token_bf16(e, token, s->hidden);
         for (uint32_t il = 0; il < SF37_MAIN_LAYERS; il++) {
             run_layer_decode(e, &s->cpu_cache, il, pos, s->hidden);
         }
