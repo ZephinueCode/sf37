@@ -164,6 +164,33 @@ static int cuda_q8_use_dp4a(void) {
     return !cuda_env_present("SF37_CUDA_NO_DP4A", "DS4_CUDA_NO_DP4A");
 }
 
+static uint64_t cuda_q8_batch_fused_max_tokens(const char *sf37_name,
+                                               const char *ds4_name,
+                                               uint64_t fallback) {
+    uint64_t v = fallback;
+    const char *env = cuda_env_value(sf37_name, ds4_name);
+    if (env) {
+        char *end = NULL;
+        unsigned long long parsed = strtoull(env, &end, 10);
+        if (end != env) v = (uint64_t)parsed;
+    }
+    return v;
+}
+
+static int cuda_q8_batch_qkvg_fused_enabled(uint64_t n_tok) {
+    if (cuda_env_present("SF37_CUDA_NO_Q8_BATCH_QKVG", NULL)) return 0;
+    const uint64_t max_tok = cuda_q8_batch_fused_max_tokens(
+            "SF37_CUDA_Q8_BATCH_QKVG_MAX_TOKENS", NULL, 64);
+    return max_tok == 0 || n_tok <= max_tok;
+}
+
+static int cuda_q8_batch_pair_fused_enabled(uint64_t n_tok) {
+    if (cuda_env_present("SF37_CUDA_NO_Q8_BATCH_PAIR", NULL)) return 0;
+    const uint64_t max_tok = cuda_q8_batch_fused_max_tokens(
+            "SF37_CUDA_Q8_BATCH_PAIR_MAX_TOKENS", NULL, 64);
+    return max_tok == 0 || n_tok <= max_tok;
+}
+
 static int cuda_qlow_q8k_enabled(void) {
     return cuda_q8_use_dp4a() &&
            !cuda_env_present("SF37_CUDA_NO_QLOW_Q8K",
@@ -214,6 +241,28 @@ static int cuda_moe_write_gate_up(void) {
 static int cuda_moe_direct_down_sum_enabled(void) {
     return !cuda_env_present("SF37_CUDA_NO_DIRECT_MOE_DOWN_SUM",
                              "DS4_CUDA_MOE_NO_DIRECT_DOWN_SUM6");
+}
+
+static int cuda_moe_expert_tiles_enabled(void);
+
+static uint32_t cuda_moe_batch_atomic_down_min_tokens(void) {
+    uint32_t v = 128;
+    const char *env = cuda_env_value("SF37_CUDA_MOE_ATOMIC_DOWN_MIN_TOKENS", NULL);
+    if (env) {
+        char *end = NULL;
+        unsigned long parsed = strtoul(env, &end, 10);
+        if (end != env && parsed <= 262144ul) v = (uint32_t)parsed;
+    }
+    return v;
+}
+
+static int cuda_moe_batch_direct_down_sum_enabled(uint32_t n_tok) {
+    if (!cuda_moe_direct_down_sum_enabled() ||
+        cuda_env_present("SF37_CUDA_MOE_NO_ATOMIC_DOWN", "DS4_CUDA_MOE_NO_ATOMIC_DOWN")) {
+        return 0;
+    }
+    if (cuda_env_present("SF37_CUDA_MOE_ATOMIC_DOWN", "DS4_CUDA_MOE_ATOMIC_DOWN")) return 1;
+    return cuda_moe_expert_tiles_enabled() && n_tok >= cuda_moe_batch_atomic_down_min_tokens();
 }
 
 static int cuda_moe_sorted_pairs_enabled(void) {
@@ -3484,6 +3533,53 @@ __global__ static void matvec_q8_0_pair_preq_kernel(float *out0,
     }
 }
 
+__global__ static void matmul_q8_0_pair_preq_batch_warp8_kernel(float *out0,
+                                                                float *out1,
+                                                                const uint8_t *w0,
+                                                                const uint8_t *w1,
+                                                                const int8_t *xq,
+                                                                const float *xscale,
+                                                                uint64_t in_dim,
+                                                                uint64_t out_dim,
+                                                                uint64_t n_tok,
+                                                                uint64_t blocks,
+                                                                int use_dp4a) {
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint64_t tok = (uint64_t)blockIdx.y;
+    const uint32_t lane = threadIdx.x & 31u;
+    if (row >= out_dim || tok >= n_tok) return;
+
+    const uint64_t row_bytes = blocks * SF37_Q8_BLOCK_SIZE;
+    const uint8_t *wr0 = w0 + row * row_bytes;
+    const uint8_t *wr1 = w1 + row * row_bytes;
+    const int8_t *xqr = xq + tok * blocks * 32u;
+    const float *xsr = xscale + tok * blocks;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        const uint64_t i0 = b * 32u;
+        const uint64_t bn = in_dim - i0 < 32u ? in_dim - i0 : 32u;
+        const int8_t *xqb = xqr + b * 32u;
+        const float xs = xsr[b];
+
+        const uint8_t *blk0 = wr0 + b * SF37_Q8_BLOCK_SIZE;
+        const float ws0 = __half2float(*(const __half *)blk0);
+        const int8_t *wq0 = (const int8_t *)(blk0 + 2);
+        acc0 += ws0 * xs * (float)dot_i8_block_dev(wq0, xqb, bn, use_dp4a);
+
+        const uint8_t *blk1 = wr1 + b * SF37_Q8_BLOCK_SIZE;
+        const float ws1 = __half2float(*(const __half *)blk1);
+        const int8_t *wq1 = (const int8_t *)(blk1 + 2);
+        acc1 += ws1 * xs * (float)dot_i8_block_dev(wq1, xqb, bn, use_dp4a);
+    }
+    acc0 = warp_sum_f32(acc0);
+    acc1 = warp_sum_f32(acc1);
+    if (lane == 0) {
+        out0[tok * out_dim + row] = acc0;
+        out1[tok * out_dim + row] = acc1;
+    }
+}
+
 __global__ static void matvec_q8_0_qkvg_preq_kernel(float *q_out,
                                                     float *k_out,
                                                     float *v_out,
@@ -3539,6 +3635,71 @@ __global__ static void matvec_q8_0_qkvg_preq_kernel(float *q_out,
         const int8_t *wq = (const int8_t *)(blk + 2);
         const int8_t *xqb = xq + b * 32u;
         acc += ws * xscale[b] * (float)dot_i8_block_dev(wq, xqb, bn, use_dp4a);
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0u) *out = acc;
+}
+
+__global__ static void matmul_q8_0_qkvg_preq_batch_warp8_kernel(
+        float *q_out,
+        float *k_out,
+        float *v_out,
+        float *g_out,
+        const uint8_t *q_w,
+        const uint8_t *k_w,
+        const uint8_t *v_w,
+        const uint8_t *g_w,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t in_dim,
+        uint64_t q_dim,
+        uint64_t kv_dim,
+        uint64_t g_dim,
+        uint64_t n_tok,
+        uint64_t blocks,
+        int use_dp4a) {
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint64_t tok = (uint64_t)blockIdx.y;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint64_t total = q_dim + kv_dim + kv_dim + g_dim;
+    if (row >= total || tok >= n_tok) return;
+
+    const uint64_t row_bytes = blocks * SF37_Q8_BLOCK_SIZE;
+    const uint8_t *wr = NULL;
+    float *out = NULL;
+    uint64_t local_row = row;
+    if (local_row < q_dim) {
+        wr = q_w + local_row * row_bytes;
+        out = q_out + tok * q_dim + local_row;
+    } else {
+        local_row -= q_dim;
+        if (local_row < kv_dim) {
+            wr = k_w + local_row * row_bytes;
+            out = k_out + tok * kv_dim + local_row;
+        } else {
+            local_row -= kv_dim;
+            if (local_row < kv_dim) {
+                wr = v_w + local_row * row_bytes;
+                out = v_out + tok * kv_dim + local_row;
+            } else {
+                local_row -= kv_dim;
+                wr = g_w + local_row * row_bytes;
+                out = g_out + tok * g_dim + local_row;
+            }
+        }
+    }
+
+    const int8_t *xqr = xq + tok * blocks * 32u;
+    const float *xsr = xscale + tok * blocks;
+    float acc = 0.0f;
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        const uint64_t i0 = b * 32u;
+        const uint64_t bn = in_dim - i0 < 32u ? in_dim - i0 : 32u;
+        const uint8_t *blk = wr + b * SF37_Q8_BLOCK_SIZE;
+        const float ws = __half2float(*(const __half *)blk);
+        const int8_t *wq = (const int8_t *)(blk + 2);
+        const int8_t *xqb = xqr + b * 32u;
+        acc += ws * xsr[b] * (float)dot_i8_block_dev(wq, xqb, bn, use_dp4a);
     }
     acc = warp_sum_f32(acc);
     if (lane == 0u) *out = acc;
@@ -4068,12 +4229,14 @@ __device__ static float dot_q3_asym_q8k_block_dev(const uint8_t *blk,
     const int8_t *xqs = xq->qs;
     const float xd = xq->d;
     if (xd == 0.0f) return 0.0f;
+#pragma unroll
     for (uint32_t g = 0; g < 4u; g++) {
         const float scale = __half2float(*(const __half *)(blk + g * 2u));
         const int32_t zp = (int32_t)(blk[8u + g] & 7u);
         const uint8_t *payload = blk + 12u + g * 24u;
         int32_t dot = 0;
         const uint32_t off = g * 64u;
+#pragma unroll
         for (uint32_t i = 0; i < 64u; i += 4u) {
             dot = __dp4a(q3_i8x4_pack_dev(payload, i),
                          *(const int32_t *)(xqs + off + i),
@@ -4091,12 +4254,14 @@ __device__ static float dot_q2_asym_q8k_block_dev(const uint8_t *blk,
     const int8_t *xqs = xq->qs;
     const float xd = xq->d;
     if (xd == 0.0f) return 0.0f;
+#pragma unroll
     for (uint32_t g = 0; g < 4u; g++) {
         const float scale = __half2float(*(const __half *)(blk + g * 2u));
         const int32_t zp = (int32_t)(blk[8u + g] & 3u);
         const uint8_t *payload = blk + 12u + g * 16u;
         int32_t dot = 0;
         const uint32_t off = g * 64u;
+#pragma unroll
         for (uint32_t i = 0; i < 64u; i += 4u) {
             dot = __dp4a(q2_i8x4_pack_dev(payload, i),
                          *(const int32_t *)(xqs + off + i),
@@ -4121,12 +4286,14 @@ __device__ static void dot_q3_asym_q8k_block8_dev(
         uint32_t np,
         float acc[8]) {
     const sf37_cuda_block_q8_k *xs[8] = {x0, x1, x2, x3, x4, x5, x6, x7};
+#pragma unroll
     for (uint32_t g = 0; g < 4u; g++) {
         const float scale = __half2float(*(const __half *)(blk + g * 2u));
         const int32_t zp = (int32_t)(blk[8u + g] & 7u);
         const uint8_t *payload = blk + 12u + g * 24u;
         const uint32_t off = g * 64u;
         int32_t dot[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+#pragma unroll
         for (uint32_t i = 0; i < 64u; i += 4u) {
             const int32_t q = q3_i8x4_pack_dev(payload, i);
 #pragma unroll
@@ -4162,12 +4329,14 @@ __device__ static void dot_q2_asym_q8k_block8_dev(
         uint32_t np,
         float acc[8]) {
     const sf37_cuda_block_q8_k *xs[8] = {x0, x1, x2, x3, x4, x5, x6, x7};
+#pragma unroll
     for (uint32_t g = 0; g < 4u; g++) {
         const float scale = __half2float(*(const __half *)(blk + g * 2u));
         const int32_t zp = (int32_t)(blk[8u + g] & 3u);
         const uint8_t *payload = blk + 12u + g * 16u;
         const uint32_t off = g * 64u;
         int32_t dot[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+#pragma unroll
         for (uint32_t i = 0; i < 64u; i += 4u) {
             const int32_t q = q2_i8x4_pack_dev(payload, i);
 #pragma unroll
@@ -5348,7 +5517,7 @@ extern "C" int sf37_cuda_routed_moe_batch_mapped(sf37_cuda_tensor *out,
             if (!gate_w || !up_w || !down_w) return 0;
 
             const int write_gate_up = cuda_moe_write_gate_up();
-            const int direct_down = cuda_moe_direct_down_sum_enabled();
+            const int direct_down = cuda_moe_batch_direct_down_sum_enabled(n_tok);
             const int use_tiles = cuda_moe_expert_tiles_enabled();
             const uint32_t tile_m = 8u;
             const uint64_t tile_capacity =
@@ -6360,6 +6529,123 @@ extern "C" int sf37_cuda_matvec_q8_0_qkvg_mapped(sf37_cuda_tensor *q_out,
     return cuda_ok(cudaGetLastError(), "q8_0 qkvg mapped matvec launch");
 }
 
+extern "C" int sf37_cuda_matmul_q8_0_qkvg_mapped(sf37_cuda_tensor *q_out,
+                                                  sf37_cuda_tensor *k_out,
+                                                  sf37_cuda_tensor *v_out,
+                                                  sf37_cuda_tensor *g_out,
+                                                  const void *model_map,
+                                                  uint64_t model_size,
+                                                  uint64_t q_weight_offset,
+                                                  uint64_t k_weight_offset,
+                                                  uint64_t v_weight_offset,
+                                                  uint64_t g_weight_offset,
+                                                  uint64_t in_dim,
+                                                  uint64_t q_dim,
+                                                  uint64_t kv_dim,
+                                                  uint64_t g_dim,
+                                                  const sf37_cuda_tensor *x,
+                                                  uint64_t n_tok) {
+    if (cuda_env_present("SF37_CUDA_NO_QKVG_FUSED",
+                         "DS4_CUDA_NO_QKVG_FUSED") ||
+        !cuda_q8_batch_qkvg_fused_enabled(n_tok)) {
+        return 0;
+    }
+    if (!q_out || !k_out || !v_out || !g_out || !x || !model_map ||
+        in_dim == 0 || q_dim == 0 || kv_dim == 0 || g_dim == 0 || n_tok == 0) {
+        return 0;
+    }
+    if (n_tok == 1) {
+        return sf37_cuda_matvec_q8_0_qkvg_mapped(q_out, k_out, v_out, g_out,
+                                                 model_map, model_size,
+                                                 q_weight_offset,
+                                                 k_weight_offset,
+                                                 v_weight_offset,
+                                                 g_weight_offset,
+                                                 in_dim, q_dim, kv_dim, g_dim,
+                                                 x);
+    }
+    if (n_tok > (uint64_t)UINT_MAX) return 0;
+    const uint64_t blocks = (in_dim + 31u) / 32u;
+    if (blocks > (uint64_t)UINT_MAX) return 0;
+    if (blocks != 0 &&
+        (q_dim > UINT64_MAX / blocks / SF37_Q8_BLOCK_SIZE ||
+         kv_dim > UINT64_MAX / blocks / SF37_Q8_BLOCK_SIZE ||
+         g_dim > UINT64_MAX / blocks / SF37_Q8_BLOCK_SIZE)) {
+        return 0;
+    }
+    if (q_dim > UINT64_MAX - kv_dim ||
+        q_dim + kv_dim > UINT64_MAX - kv_dim ||
+        q_dim + kv_dim + kv_dim > UINT64_MAX - g_dim ||
+        n_tok > UINT64_MAX / in_dim / sizeof(float) ||
+        n_tok > UINT64_MAX / q_dim / sizeof(float) ||
+        n_tok > UINT64_MAX / kv_dim / sizeof(float) ||
+        n_tok > UINT64_MAX / g_dim / sizeof(float)) {
+        return 0;
+    }
+    const uint64_t q_weight_bytes = q_dim * blocks * SF37_Q8_BLOCK_SIZE;
+    const uint64_t kv_weight_bytes = kv_dim * blocks * SF37_Q8_BLOCK_SIZE;
+    const uint64_t g_weight_bytes = g_dim * blocks * SF37_Q8_BLOCK_SIZE;
+    if (!mapped_range_ok(model_size, q_weight_offset, q_weight_bytes) ||
+        !mapped_range_ok(model_size, k_weight_offset, kv_weight_bytes) ||
+        !mapped_range_ok(model_size, v_weight_offset, kv_weight_bytes) ||
+        !mapped_range_ok(model_size, g_weight_offset, g_weight_bytes) ||
+        q_out->bytes < n_tok * q_dim * sizeof(float) ||
+        k_out->bytes < n_tok * kv_dim * sizeof(float) ||
+        v_out->bytes < n_tok * kv_dim * sizeof(float) ||
+        g_out->bytes < n_tok * g_dim * sizeof(float) ||
+        x->bytes < n_tok * in_dim * sizeof(float)) {
+        return 0;
+    }
+
+    const uint8_t *qw = (const uint8_t *)cuda_model_range_ptr(model_map, q_weight_offset,
+                                                              q_weight_bytes, "q8_0_q_proj");
+    const uint8_t *kw = (const uint8_t *)cuda_model_range_ptr(model_map, k_weight_offset,
+                                                              kv_weight_bytes, "q8_0_k_proj");
+    const uint8_t *vw = (const uint8_t *)cuda_model_range_ptr(model_map, v_weight_offset,
+                                                              kv_weight_bytes, "q8_0_v_proj");
+    const uint8_t *gw = (const uint8_t *)cuda_model_range_ptr(model_map, g_weight_offset,
+                                                              g_weight_bytes, "q8_0_g_proj");
+    if (!qw || !kw || !vw || !gw) return 0;
+
+    if (n_tok > UINT64_MAX / blocks / 32u ||
+        n_tok > UINT64_MAX / blocks / sizeof(float)) {
+        return 0;
+    }
+    const uint64_t xq_bytes = n_tok * blocks * 32u;
+    const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
+    const uint64_t scale_bytes = n_tok * blocks * sizeof(float);
+    if (scale_offset > UINT64_MAX - scale_bytes) return 0;
+    const uint64_t tmp_bytes = scale_offset + scale_bytes;
+    void *tmp = cuda_tmp_alloc(tmp_bytes, "q8_0 qkvg batch prequant");
+    if (!tmp) return 0;
+    int8_t *xq = (int8_t *)tmp;
+    float *xscale = (float *)((char *)tmp + scale_offset);
+    dim3 qgrid((unsigned)blocks, (unsigned)n_tok, 1u);
+    quantize_q8_0_f32_kernel<<<qgrid, 32>>>(
+            xq, xscale, (const float *)x->ptr, in_dim, blocks);
+    if (!cuda_ok(cudaGetLastError(), "q8_0 qkvg batch quantize launch")) return 0;
+
+    const uint64_t total = q_dim + kv_dim + kv_dim + g_dim;
+    const int use_dp4a = cuda_q8_use_dp4a();
+    dim3 grid((unsigned)((total + 7u) / 8u), (unsigned)n_tok, 1u);
+    matmul_q8_0_qkvg_preq_batch_warp8_kernel<<<grid, 256>>>(
+            (float *)q_out->ptr,
+            (float *)k_out->ptr,
+            (float *)v_out->ptr,
+            (float *)g_out->ptr,
+            qw, kw, vw, gw,
+            xq,
+            xscale,
+            in_dim,
+            q_dim,
+            kv_dim,
+            g_dim,
+            n_tok,
+            blocks,
+            use_dp4a);
+    return cuda_ok(cudaGetLastError(), "q8_0 qkvg mapped batch launch");
+}
+
 extern "C" int sf37_cuda_matmul_q8_0_mapped(sf37_cuda_tensor *out,
                                              const void *model_map,
                                              uint64_t model_size,
@@ -6498,6 +6784,60 @@ extern "C" int sf37_cuda_matmul_q8_0_pair_mapped(sf37_cuda_tensor *out0,
                                                  in_dim,
                                                  out_dim,
                                                  x);
+    }
+    if (n_tok > 1 && cuda_q8_batch_pair_fused_enabled(n_tok)) {
+        const uint64_t blocks = (in_dim + 31u) / 32u;
+        if (n_tok > (uint64_t)UINT_MAX || blocks > (uint64_t)UINT_MAX) return 0;
+        if (blocks != 0 && out_dim > UINT64_MAX / blocks / SF37_Q8_BLOCK_SIZE) return 0;
+        if (n_tok > UINT64_MAX / in_dim / sizeof(float) ||
+            n_tok > UINT64_MAX / out_dim / sizeof(float) ||
+            n_tok > UINT64_MAX / blocks / 32u ||
+            n_tok > UINT64_MAX / blocks / sizeof(float)) {
+            return 0;
+        }
+        const uint64_t weight_bytes = out_dim * blocks * SF37_Q8_BLOCK_SIZE;
+        if (!mapped_range_ok(model_size, weight0_offset, weight_bytes) ||
+            !mapped_range_ok(model_size, weight1_offset, weight_bytes) ||
+            x->bytes < n_tok * in_dim * sizeof(float) ||
+            out0->bytes < n_tok * out_dim * sizeof(float) ||
+            out1->bytes < n_tok * out_dim * sizeof(float)) {
+            return 0;
+        }
+        const uint8_t *w0 = (const uint8_t *)cuda_model_range_ptr(model_map, weight0_offset,
+                                                                  weight_bytes, "q8_0_pair0");
+        const uint8_t *w1 = (const uint8_t *)cuda_model_range_ptr(model_map, weight1_offset,
+                                                                  weight_bytes, "q8_0_pair1");
+        if (!w0 || !w1) return 0;
+
+        const uint64_t xq_bytes = n_tok * blocks * 32u;
+        const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
+        const uint64_t scale_bytes = n_tok * blocks * sizeof(float);
+        if (scale_offset > UINT64_MAX - scale_bytes) return 0;
+        const uint64_t tmp_bytes = scale_offset + scale_bytes;
+        void *tmp = cuda_tmp_alloc(tmp_bytes, "q8_0 pair batch prequant");
+        if (!tmp) return 0;
+        int8_t *xq = (int8_t *)tmp;
+        float *xscale = (float *)((char *)tmp + scale_offset);
+        dim3 qgrid((unsigned)blocks, (unsigned)n_tok, 1u);
+        quantize_q8_0_f32_kernel<<<qgrid, 32>>>(
+                xq, xscale, (const float *)x->ptr, in_dim, blocks);
+        if (!cuda_ok(cudaGetLastError(), "q8_0 pair batch quantize launch")) return 0;
+
+        const int use_dp4a = cuda_q8_use_dp4a();
+        dim3 grid((unsigned)((out_dim + 7u) / 8u), (unsigned)n_tok, 1u);
+        matmul_q8_0_pair_preq_batch_warp8_kernel<<<grid, 256>>>(
+                (float *)out0->ptr,
+                (float *)out1->ptr,
+                w0,
+                w1,
+                xq,
+                xscale,
+                in_dim,
+                out_dim,
+                n_tok,
+                blocks,
+                use_dp4a);
+        return cuda_ok(cudaGetLastError(), "q8_0 pair mapped batch launch");
     }
     if (!sf37_cuda_matmul_q8_0_mapped(out0,
                                       model_map,
