@@ -61,14 +61,15 @@
 #define SF37_RMS_EPS 1.0e-5f
 #define SF37_PI 3.14159265358979323846
 #define SF37_SESSION_SNAPSHOT_MAGIC 0x37334653u
-#define SF37_SESSION_SNAPSHOT_VERSION 1u
+#define SF37_SESSION_SNAPSHOT_VERSION 2u
 #define SF37_SESSION_SNAPSHOT_U32_FIELDS 11u
 #define SF37_SESSION_PAYLOAD_MAGIC 0x37375053u
-#define SF37_SESSION_PAYLOAD_VERSION 2u
+#define SF37_SESSION_PAYLOAD_VERSION 3u
 #define SF37_SESSION_PAYLOAD_U32_FIELDS 15u
 #define SF37_SESSION_PAYLOAD_KV_I8_GROUPED 1u
 #define SF37_SESSION_PAYLOAD_KV_GROUP 64u
 #define SF37_SESSION_IO_CHUNK (1024u * 1024u)
+#define SF37_CUDA_SLIDING_CACHE_MAX 8192u
 
 typedef enum {
     GGUF_VALUE_UINT8   = 0,
@@ -2955,7 +2956,11 @@ typedef struct {
     sf37_cuda_tensor *logits;
     sf37_cuda_tensor *k_cache[SF37_MAIN_LAYERS];
     sf37_cuda_tensor *v_cache[SF37_MAIN_LAYERS];
-    uint32_t cache_cap;
+    uint32_t cache_cap[SF37_MAIN_LAYERS];
+    uint32_t ctx_size;
+    uint32_t prefill_cap;
+    uint64_t kv_cache_bytes;
+    bool managed_kv_cache;
 } sf37_cuda_decode_state;
 
 typedef struct {
@@ -3049,6 +3054,91 @@ static void cuda_prefill_state_free(sf37_cuda_prefill_state *s) {
     memset(s, 0, sizeof(*s));
 }
 
+static uint32_t cuda_prefill_default_chunk(uint32_t suffix);
+
+static uint32_t sf37_align_up_u32(uint32_t v, uint32_t align) {
+    if (align == 0) return v;
+    const uint32_t rem = v % align;
+    if (rem == 0) return v;
+    if (v > UINT32_MAX - (align - rem)) return UINT32_MAX;
+    return v + (align - rem);
+}
+
+static uint32_t cuda_sliding_cache_cap(uint32_t ctx_size, uint32_t prefill_cap) {
+    if (ctx_size == 0) return 1;
+    uint32_t raw_window = SF37_SLIDING_WINDOW;
+    if (raw_window > ctx_size) raw_window = ctx_size;
+    if (raw_window == 0) raw_window = 1;
+
+    uint64_t wanted = (uint64_t)raw_window + (uint64_t)prefill_cap;
+    if (wanted > ctx_size) wanted = ctx_size;
+    if (wanted == 0) wanted = 1;
+    wanted = sf37_align_up_u32((uint32_t)wanted, 256u);
+    if (wanted > ctx_size) wanted = ctx_size;
+    if (wanted > SF37_CUDA_SLIDING_CACHE_MAX) wanted = SF37_CUDA_SLIDING_CACHE_MAX;
+    if (wanted < raw_window) wanted = raw_window;
+    return (uint32_t)wanted;
+}
+
+static uint32_t cuda_sliding_cache_prefill_cap(uint32_t ctx_size, uint32_t cache_cap) {
+    if (cache_cap == 0) return 0;
+    uint32_t raw_window = SF37_SLIDING_WINDOW;
+    if (raw_window > ctx_size) raw_window = ctx_size;
+    if (raw_window == 0) raw_window = 1;
+    if (ctx_size <= raw_window) return cache_cap;
+    if (cache_cap <= raw_window) return 1;
+    return cache_cap - raw_window;
+}
+
+static uint64_t cuda_decode_kv_bytes_for_cap(uint32_t cap) {
+    const uint64_t kv_dim = (uint64_t)SF37_KV_HEADS * SF37_HEAD_DIM;
+    return (uint64_t)cap * kv_dim * 2u * sizeof(float);
+}
+
+static uint64_t cuda_prefill_scratch_bytes(uint32_t cap) {
+    if (cap == 0) return 0;
+    const uint64_t cap64 = cap;
+    const uint64_t embd = SF37_EMBD;
+    const uint64_t max_q_dim = (uint64_t)SF37_SLIDING_Q_HEADS * SF37_HEAD_DIM;
+    const uint64_t kv_dim = (uint64_t)SF37_KV_HEADS * SF37_HEAD_DIM;
+    uint64_t bytes = 0;
+    bytes += cap64 * sizeof(int32_t);
+    bytes += cap64 * embd * sizeof(float) * 2u;
+    bytes += cap64 * max_q_dim * sizeof(float) * 2u;
+    bytes += cap64 * kv_dim * sizeof(float) * 2u;
+    bytes += cap64 * SF37_SLIDING_Q_HEADS * sizeof(float);
+    bytes += cap64 * embd * sizeof(float) * 3u;
+    bytes += cap64 * SF37_DENSE_FF * sizeof(float) * 3u;
+    bytes += cap64 * SF37_EXPERTS * sizeof(float) * 2u;
+    bytes += cap64 * SF37_EXPERT_USED * sizeof(int32_t);
+    bytes += cap64 * SF37_EXPERT_USED * sizeof(float);
+    bytes += (uint64_t)SF37_EXPERT_USED * SF37_EXPERT_FF * sizeof(float) * 3u;
+    bytes += (uint64_t)SF37_EXPERT_USED * SF37_EMBD * sizeof(float);
+    return bytes;
+}
+
+static uint64_t cuda_decode_scratch_bytes(void) {
+    const uint64_t embd_bytes = (uint64_t)SF37_EMBD * sizeof(float);
+    const uint64_t max_q_dim = (uint64_t)SF37_SLIDING_Q_HEADS * SF37_HEAD_DIM;
+    const uint64_t kv_dim = (uint64_t)SF37_KV_HEADS * SF37_HEAD_DIM;
+    uint64_t bytes = 0;
+    bytes += embd_bytes * 7u;
+    bytes += max_q_dim * sizeof(float) * 2u;
+    bytes += kv_dim * sizeof(float) * 2u;
+    bytes += (uint64_t)SF37_SLIDING_Q_HEADS * sizeof(float);
+    bytes += (uint64_t)SF37_DENSE_FF * sizeof(float) * 3u;
+    bytes += (uint64_t)SF37_EXPERTS * sizeof(float) * 2u;
+    bytes += (uint64_t)SF37_EXPERT_USED * sizeof(int32_t);
+    bytes += (uint64_t)SF37_EXPERT_USED * sizeof(float);
+    bytes += (uint64_t)SF37_EXPERT_USED * SF37_EMBD * sizeof(float);
+    bytes += (uint64_t)SF37_VOCAB * sizeof(float);
+    return bytes;
+}
+
+static sf37_cuda_tensor *cuda_alloc_kv_cache_tensor(bool managed, uint64_t bytes) {
+    return managed ? sf37_cuda_tensor_alloc_managed(bytes) : sf37_cuda_tensor_alloc(bytes);
+}
+
 static int cuda_prefill_state_init(sf37_cuda_prefill_state *s, uint32_t cap) {
     memset(s, 0, sizeof(*s));
     if (cap == 0) return 0;
@@ -3092,16 +3182,56 @@ static int cuda_prefill_state_init(sf37_cuda_prefill_state *s, uint32_t cap) {
     return 1;
 }
 
-static int cuda_decode_state_init(sf37_cuda_decode_state *s, uint32_t cache_cap) {
+static int cuda_decode_state_init(sf37_cuda_decode_state *s, uint32_t ctx_size) {
     memset(s, 0, sizeof(*s));
-    if (cache_cap == 0) cache_cap = 1;
-    s->cache_cap = cache_cap;
+    if (ctx_size == 0) ctx_size = 1;
+    if (ctx_size > SF37_CTX) ctx_size = SF37_CTX;
+    s->ctx_size = ctx_size;
 
     const uint64_t embd_bytes = (uint64_t)SF37_EMBD * sizeof(float);
     const uint64_t max_q_dim = (uint64_t)SF37_SLIDING_Q_HEADS * SF37_HEAD_DIM;
     const uint64_t kv_dim = (uint64_t)SF37_KV_HEADS * SF37_HEAD_DIM;
     const uint64_t dense_ff_bytes = (uint64_t)SF37_DENSE_FF * sizeof(float);
     const uint64_t routed_down_bytes = (uint64_t)SF37_EXPERT_USED * SF37_EMBD * sizeof(float);
+    const uint32_t requested_prefill_cap = cuda_prefill_default_chunk(ctx_size);
+    const uint32_t sliding_cap = cuda_sliding_cache_cap(ctx_size, requested_prefill_cap);
+    uint32_t full_layers = 0;
+    uint32_t sliding_layers = 0;
+    s->prefill_cap = cuda_sliding_cache_prefill_cap(ctx_size, sliding_cap);
+    if (s->prefill_cap == 0) s->prefill_cap = 1;
+    for (uint32_t il = 0; il < SF37_MAIN_LAYERS; il++) {
+        if (layer_is_full(il)) {
+            s->cache_cap[il] = ctx_size;
+            full_layers++;
+        } else {
+            s->cache_cap[il] = sliding_cap;
+            sliding_layers++;
+        }
+        s->kv_cache_bytes += cuda_decode_kv_bytes_for_cap(s->cache_cap[il]);
+    }
+    const uint64_t context_bytes = s->kv_cache_bytes +
+                                   cuda_decode_scratch_bytes() +
+                                   cuda_prefill_scratch_bytes(s->prefill_cap);
+    s->managed_kv_cache =
+        sf37_cuda_should_use_managed_kv_cache(s->kv_cache_bytes, context_bytes) != 0;
+    fprintf(stderr,
+            "sf37: CUDA KV cache ctx=%u full_layers=%u full_cap=%u "
+            "sliding_layers=%u sliding_cap=%u prefill_cap=%u kv=%.2f GiB%s\n",
+            ctx_size,
+            full_layers,
+            ctx_size,
+            sliding_layers,
+            sliding_cap,
+            s->prefill_cap,
+            (double)s->kv_cache_bytes / 1073741824.0,
+            s->managed_kv_cache ? " managed" : "");
+    if (s->managed_kv_cache) {
+        fprintf(stderr,
+                "sf37: CUDA using managed KV cache "
+                "(kv cache %.2f GiB, context buffers %.2f GiB)\n",
+                (double)s->kv_cache_bytes / 1073741824.0,
+                (double)context_bytes / 1073741824.0);
+    }
 
     s->hidden = sf37_cuda_tensor_alloc(embd_bytes);
     s->attn_norm = sf37_cuda_tensor_alloc(embd_bytes);
@@ -3135,8 +3265,11 @@ static int cuda_decode_state_init(sf37_cuda_decode_state *s, uint32_t cache_cap)
     }
 
     for (uint32_t il = 0; il < SF37_MAIN_LAYERS; il++) {
-        s->k_cache[il] = sf37_cuda_tensor_alloc((uint64_t)cache_cap * kv_dim * sizeof(float));
-        s->v_cache[il] = sf37_cuda_tensor_alloc((uint64_t)cache_cap * kv_dim * sizeof(float));
+        const uint32_t cap = s->cache_cap[il];
+        s->k_cache[il] = cuda_alloc_kv_cache_tensor(s->managed_kv_cache,
+                                                    (uint64_t)cap * kv_dim * sizeof(float));
+        s->v_cache[il] = cuda_alloc_kv_cache_tensor(s->managed_kv_cache,
+                                                    (uint64_t)cap * kv_dim * sizeof(float));
         if (!s->k_cache[il] || !s->v_cache[il]) {
             sf37_log(stderr, SF37_LOG_ERROR, "CUDA KV cache allocation failed for layer %u", il);
             cuda_decode_state_free(s);
@@ -3158,9 +3291,8 @@ static int cuda_decode_layer(sf37_engine *e, sf37_cuda_decode_state *s,
     const uint32_t rotary_dim = layer_rotary_dim(il);
     const double theta = layer_rope_theta(il);
     const int full = layer_is_full(il) ? 1 : 0;
-    const uint32_t cache_slot = pos % s->cache_cap;
-    uint32_t n_cache = pos + 1u;
-    if (n_cache > s->cache_cap) n_cache = s->cache_cap;
+    const uint32_t cache_cap = s->cache_cap[il] ? s->cache_cap[il] : 1u;
+    const uint32_t cache_slot = pos % cache_cap;
     int ok = 1;
     (void)sf37_cuda_begin_layer(il);
     cuda_preload_layer_weights(e, il);
@@ -3208,11 +3340,12 @@ static int cuda_decode_layer(sf37_engine *e, sf37_cuda_decode_state *s,
                                            s->k, 0, (uint64_t)kv_dim * sizeof(float)), "k cache store");
     CUDA_LAYER_CHECK(sf37_cuda_tensor_copy(s->v_cache[il], (uint64_t)cache_slot * kv_dim * sizeof(float),
                                            s->v, 0, (uint64_t)kv_dim * sizeof(float)), "v cache store");
-    CUDA_LAYER_CHECK(sf37_cuda_attention_decode_heads(s->attn_heads, s->q,
-                                                      s->k_cache[il], s->v_cache[il], s->head_gate,
-                                                      n_cache, s->cache_cap, q_heads,
-                                                      SF37_KV_HEADS, SF37_HEAD_DIM,
-                                                      full ? 0 : 1, SF37_SLIDING_WINDOW),
+    CUDA_LAYER_CHECK(sf37_cuda_attention_decode_heads_at(s->attn_heads, s->q,
+                                                         s->k_cache[il], s->v_cache[il],
+                                                         s->head_gate,
+                                                         pos, cache_cap, q_heads,
+                                                         SF37_KV_HEADS, SF37_HEAD_DIM,
+                                                         full ? 0 : 1, SF37_SLIDING_WINDOW),
                      "attention decode");
     CUDA_LAYER_CHECK(sf37_cuda_matvec_q8_0_mapped(s->attn_out, e->gguf.map, e->gguf.size,
                                                   l->o_proj->abs_offset,
@@ -4840,6 +4973,8 @@ static bool cuda_prefill_ensure_routed_mid_pairs(sf37_session *s, uint32_t cap) 
 static uint32_t cuda_prefill_select_chunk_cap(sf37_session *s, uint32_t suffix) {
     if (!s || suffix == 0) return 0;
     uint32_t wanted = cuda_prefill_default_chunk(suffix);
+    const uint32_t state_cap = s->cuda_state.prefill_cap;
+    if (state_cap != 0 && wanted > state_cap) wanted = state_cap;
     if (wanted > suffix) wanted = suffix;
     if (wanted == 0) wanted = suffix;
     const uint32_t fixed[] = {4096, 2048, 1024, 512, 256};
@@ -4848,6 +4983,7 @@ static uint32_t cuda_prefill_select_chunk_cap(sf37_session *s, uint32_t suffix) 
     candidates[n++] = wanted;
     for (uint32_t i = 0; i < (uint32_t)(sizeof(fixed) / sizeof(fixed[0])); i++) {
         uint32_t c = fixed[i];
+        if (state_cap != 0 && c > state_cap) c = state_cap;
         if (c > suffix) c = suffix;
         if (c == 0) continue;
         bool seen = false;
@@ -5487,6 +5623,7 @@ static int cuda_prefill_layer(sf37_engine *e,
     const uint32_t rotary_dim = layer_rotary_dim(il);
     const double theta = layer_rope_theta(il);
     const int full = layer_is_full(il) ? 1 : 0;
+    const uint32_t cache_cap = d->cache_cap[il] ? d->cache_cap[il] : 1u;
     int ok = 1;
     const bool profile = cuda_prefill_profile_enabled();
     const double t0 = profile ? sf37_now_sec() : 0.0;
@@ -5548,12 +5685,12 @@ static int cuda_prefill_layer(sf37_engine *e,
                        "k rope batch");
     CUDA_PREFILL_CHECK(sf37_cuda_store_kv_cache_batch(d->k_cache[il], d->v_cache[il],
                                                       p->k, p->v, pos0, n_tok,
-                                                      d->cache_cap, kv_dim),
+                                                      cache_cap, kv_dim),
                        "kv cache store batch");
     CUDA_PREFILL_CHECK(sf37_cuda_attention_prefill_heads(p->attn_heads, p->q,
                                                          d->k_cache[il], d->v_cache[il],
                                                          p->head_gate,
-                                                         pos0, n_tok, d->cache_cap,
+                                                         pos0, n_tok, cache_cap,
                                                          q_heads, SF37_KV_HEADS,
                                                          SF37_HEAD_DIM,
                                                          full ? 0 : 1,
@@ -6132,6 +6269,42 @@ static uint32_t session_live_kv_rows(const sf37_session *s) {
     return n;
 }
 
+static uint32_t session_layer_kv_cap(const sf37_session *s, uint32_t il) {
+    if (!s || il >= SF37_MAIN_LAYERS || s->ctx_size <= 0) return 0;
+#ifdef SF37_USE_CUDA
+    if (session_uses_cuda(s) && s->cuda_state_ready && s->cuda_state.cache_cap[il] != 0) {
+        return s->cuda_state.cache_cap[il];
+    }
+#endif
+    return (uint32_t)s->ctx_size;
+}
+
+static uint32_t session_layer_live_kv_rows(const sf37_session *s, uint32_t il) {
+    uint32_t rows = session_live_kv_rows(s);
+    const uint32_t cap = session_layer_kv_cap(s, il);
+    if (cap != 0 && rows > cap) rows = cap;
+    if (s && !session_uses_cuda(s) && il < SF37_MAIN_LAYERS && !layer_is_full(il) &&
+        s->cpu_cache.layer[il].n != 0 && rows > s->cpu_cache.layer[il].n) {
+        rows = s->cpu_cache.layer[il].n;
+    }
+    return rows;
+}
+
+static void session_kv_row_counts(const sf37_session *s,
+                                  uint32_t rows[SF37_MAIN_LAYERS]) {
+    for (uint32_t il = 0; il < SF37_MAIN_LAYERS; il++) {
+        rows[il] = session_layer_live_kv_rows(s, il);
+    }
+}
+
+static uint64_t session_live_kv_row_sum(const sf37_session *s) {
+    uint64_t rows = 0;
+    for (uint32_t il = 0; il < SF37_MAIN_LAYERS; il++) {
+        rows += session_layer_live_kv_rows(s, il);
+    }
+    return rows;
+}
+
 void sf37_session_rewind(sf37_session *s, int pos) {
     if (!s) return;
     if (pos < 0) pos = 0;
@@ -6375,27 +6548,29 @@ static int payload_copy_file_bytes(FILE *src, FILE *dst, uint64_t bytes,
 
 uint64_t sf37_session_snapshot_bytes(sf37_session *s) {
     if (!s || !s->checkpoint_valid) return 0;
-    const uint32_t live_rows = session_live_kv_rows(s);
+    const uint64_t live_rows = session_live_kv_row_sum(s);
     const uint64_t kv_row = (uint64_t)SF37_KV_HEADS * SF37_HEAD_DIM;
     uint64_t bytes = (uint64_t)SF37_SESSION_SNAPSHOT_U32_FIELDS * sizeof(uint32_t);
+    bytes += (uint64_t)SF37_MAIN_LAYERS * sizeof(uint32_t);
     bytes += (uint64_t)s->checkpoint.len * sizeof(uint32_t);
     bytes += (uint64_t)SF37_VOCAB * sizeof(float);
     bytes += (uint64_t)SF37_EMBD * sizeof(float);
-    bytes += (uint64_t)SF37_MAIN_LAYERS * live_rows * kv_row * 2u * sizeof(float);
+    bytes += live_rows * kv_row * 2u * sizeof(float);
     return bytes;
 }
 
 uint64_t sf37_session_payload_bytes(sf37_session *s) {
     if (!s || !s->checkpoint_valid) return 0;
-    const uint32_t live_rows = session_live_kv_rows(s);
+    const uint64_t live_rows = session_live_kv_row_sum(s);
     const uint32_t kv_row = SF37_KV_HEADS * SF37_HEAD_DIM;
     const uint64_t encoded_row = payload_encoded_kv_row_bytes(kv_row,
                                                               SF37_SESSION_PAYLOAD_KV_GROUP);
     uint64_t bytes = (uint64_t)SF37_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
+    bytes += (uint64_t)SF37_MAIN_LAYERS * sizeof(uint32_t);
     bytes += (uint64_t)s->checkpoint.len * sizeof(uint32_t);
     bytes += (uint64_t)SF37_VOCAB * sizeof(float);
     bytes += (uint64_t)SF37_EMBD * sizeof(float);
-    bytes += (uint64_t)SF37_MAIN_LAYERS * live_rows * 2u * encoded_row;
+    bytes += live_rows * 2u * encoded_row;
     return bytes;
 }
 
@@ -6498,6 +6673,8 @@ int sf37_session_save_payload(sf37_session *s, FILE *fp, char *err, size_t errle
 
     const uint32_t token_count = (uint32_t)s->checkpoint.len;
     const uint32_t live_rows = session_live_kv_rows(s);
+    uint32_t row_counts[SF37_MAIN_LAYERS];
+    session_kv_row_counts(s, row_counts);
     const uint32_t kv_row = SF37_KV_HEADS * SF37_HEAD_DIM;
     const uint32_t group = SF37_SESSION_PAYLOAD_KV_GROUP;
     const uint32_t groups = payload_kv_groups_per_row(kv_row, group);
@@ -6523,6 +6700,9 @@ int sf37_session_save_payload(sf37_session *s, FILE *fp, char *err, size_t errle
     for (uint32_t i = 0; i < SF37_SESSION_PAYLOAD_U32_FIELDS; i++) {
         if (payload_write_u32(fp, header[i], err, errlen) != 0) return 1;
     }
+    for (uint32_t il = 0; il < SF37_MAIN_LAYERS; il++) {
+        if (payload_write_u32(fp, row_counts[il], err, errlen) != 0) return 1;
+    }
     for (int i = 0; i < s->checkpoint.len; i++) {
         if (payload_write_u32(fp, (uint32_t)s->checkpoint.v[i], err, errlen) != 0) return 1;
     }
@@ -6538,10 +6718,12 @@ int sf37_session_save_payload(sf37_session *s, FILE *fp, char *err, size_t errle
     int rc = 0;
     if (session_uses_cuda(s)) {
 #ifdef SF37_USE_CUDA
-        const uint32_t first_pos = token_count - live_rows;
         for (uint32_t il = 0; rc == 0 && il < SF37_MAIN_LAYERS; il++) {
-            for (uint32_t r = 0; rc == 0 && r < live_rows; r++) {
-                const uint32_t phys = (first_pos + r) % s->cuda_state.cache_cap;
+            const uint32_t rows = row_counts[il];
+            const uint32_t first_pos = token_count - rows;
+            const uint32_t cache_cap = s->cuda_state.cache_cap[il];
+            for (uint32_t r = 0; rc == 0 && r < rows; r++) {
+                const uint32_t phys = (first_pos + r) % cache_cap;
                 const uint64_t off = (uint64_t)phys * kv_row * sizeof(float);
                 if (!sf37_cuda_tensor_read(s->cuda_state.k_cache[il], off, row_buf,
                                            (uint64_t)kv_row * sizeof(float))) {
@@ -6568,13 +6750,14 @@ int sf37_session_save_payload(sf37_session *s, FILE *fp, char *err, size_t errle
     } else {
         for (uint32_t il = 0; rc == 0 && il < SF37_MAIN_LAYERS; il++) {
             const sf37_layer_kv_cache *layer = &s->cpu_cache.layer[il];
-            if (layer->n < live_rows) {
+            const uint32_t rows = row_counts[il];
+            if (layer->n < rows) {
                 snapshot_set_err(err, errlen, "CPU KV cache has fewer live rows than checkpoint");
                 rc = 1;
                 break;
             }
-            const uint32_t start = layer->n - live_rows;
-            for (uint32_t r = 0; rc == 0 && r < live_rows; r++) {
+            const uint32_t start = layer->n - rows;
+            for (uint32_t r = 0; rc == 0 && r < rows; r++) {
                 const float *k = layer->k + ((uint64_t)start + r) * kv_row;
                 const float *v = layer->v + ((uint64_t)start + r) * kv_row;
                 payload_encode_kv_row_i8_grouped(k, kv_row, group, enc_buf);
@@ -6608,6 +6791,10 @@ int sf37_session_load_payload(sf37_session *s, FILE *fp, uint64_t payload_bytes,
         snapshot_set_err(err, errlen, "unsupported session payload version");
         return 1;
     }
+    uint32_t row_counts[SF37_MAIN_LAYERS];
+    for (uint32_t il = 0; il < SF37_MAIN_LAYERS; il++) {
+        if (payload_read_u32(fp, &row_counts[il], &remaining, err, errlen) != 0) return 1;
+    }
 
     const uint32_t saved_ctx = h[2];
     const uint32_t token_count = h[3];
@@ -6625,6 +6812,33 @@ int sf37_session_load_payload(sf37_session *s, FILE *fp, uint64_t payload_bytes,
         snapshot_set_err(err, errlen, "session payload has invalid token/cache row counts");
         return 1;
     }
+    uint64_t row_sum = 0;
+    for (uint32_t il = 0; il < SF37_MAIN_LAYERS; il++) {
+        const uint32_t rows = row_counts[il];
+        if (rows > live_rows) {
+            snapshot_set_err(err, errlen, "session payload has too many KV rows for layer %u", il);
+            return 1;
+        }
+        if (layer_is_full(il)) {
+            if (rows != live_rows) {
+                snapshot_set_err(err, errlen, "session payload is missing full-attention KV rows");
+                return 1;
+            }
+        } else {
+            const uint32_t needed = live_rows < SF37_SLIDING_WINDOW ?
+                                    live_rows : SF37_SLIDING_WINDOW;
+            if (rows < needed) {
+                snapshot_set_err(err, errlen, "session payload is missing sliding-window KV rows");
+                return 1;
+            }
+        }
+        const uint32_t cap = session_layer_kv_cap(s, il);
+        if (cap != 0 && rows > cap) {
+            snapshot_set_err(err, errlen, "session payload KV rows do not fit current cache");
+            return 1;
+        }
+        row_sum += rows;
+    }
     if (h[5] != SF37_MAIN_LAYERS ||
         h[6] != SF37_KV_HEADS ||
         h[7] != SF37_HEAD_DIM ||
@@ -6639,10 +6853,11 @@ int sf37_session_load_payload(sf37_session *s, FILE *fp, uint64_t payload_bytes,
     }
     const uint64_t expected_bytes =
         (uint64_t)SF37_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t) +
+        (uint64_t)SF37_MAIN_LAYERS * sizeof(uint32_t) +
         (uint64_t)token_count * sizeof(uint32_t) +
         (uint64_t)SF37_VOCAB * sizeof(float) +
         (uint64_t)SF37_EMBD * sizeof(float) +
-        (uint64_t)SF37_MAIN_LAYERS * live_rows * 2u * encoded_row;
+        row_sum * 2u * encoded_row;
     if (payload_bytes != expected_bytes) {
         snapshot_set_err(err, errlen, "session payload byte count mismatch");
         return 1;
@@ -6673,10 +6888,12 @@ int sf37_session_load_payload(sf37_session *s, FILE *fp, uint64_t payload_bytes,
     int rc = 0;
     if (session_uses_cuda(s)) {
 #ifdef SF37_USE_CUDA
-        const uint32_t first_pos = token_count - live_rows;
         for (uint32_t il = 0; rc == 0 && il < SF37_MAIN_LAYERS; il++) {
-            for (uint32_t rr = 0; rc == 0 && rr < live_rows; rr++) {
-                const uint32_t phys = (first_pos + rr) % s->cuda_state.cache_cap;
+            const uint32_t rows = row_counts[il];
+            const uint32_t first_pos = token_count - rows;
+            const uint32_t cache_cap = s->cuda_state.cache_cap[il];
+            for (uint32_t rr = 0; rc == 0 && rr < rows; rr++) {
+                const uint32_t phys = (first_pos + rr) % cache_cap;
                 const uint64_t off = (uint64_t)phys * kv_row * sizeof(float);
                 if (payload_read_bytes(fp, enc_buf, encoded_row, &remaining,
                                        err, errlen) != 0) {
@@ -6716,7 +6933,8 @@ int sf37_session_load_payload(sf37_session *s, FILE *fp, uint64_t payload_bytes,
     } else {
         for (uint32_t il = 0; rc == 0 && il < SF37_MAIN_LAYERS; il++) {
             sf37_layer_kv_cache *layer = &s->cpu_cache.layer[il];
-            for (uint32_t rr = 0; rc == 0 && rr < live_rows; rr++) {
+            const uint32_t rows = row_counts[il];
+            for (uint32_t rr = 0; rc == 0 && rr < rows; rr++) {
                 if (payload_read_bytes(fp, enc_buf, encoded_row, &remaining,
                                        err, errlen) != 0) {
                     rc = 1;
@@ -6732,7 +6950,7 @@ int sf37_session_load_payload(sf37_session *s, FILE *fp, uint64_t payload_bytes,
                 payload_decode_kv_row_i8_grouped(enc_buf, kv_row, group,
                                                  layer->v + (uint64_t)rr * kv_row);
             }
-            if (rc == 0) layer->n = live_rows;
+            if (rc == 0) layer->n = rows;
         }
     }
     free(enc_buf);
@@ -6785,6 +7003,8 @@ int sf37_session_save_snapshot(sf37_session *s, sf37_session_snapshot *snap,
     sf37_snapshot_writer w = { .p = snap->ptr, .cap = snap->cap, .pos = 0 };
     const uint32_t token_count = (uint32_t)s->checkpoint.len;
     const uint32_t live_rows = session_live_kv_rows(s);
+    uint32_t row_counts[SF37_MAIN_LAYERS];
+    session_kv_row_counts(s, row_counts);
     const uint64_t kv_row = (uint64_t)SF37_KV_HEADS * SF37_HEAD_DIM;
     const uint32_t backend_kind = session_uses_cuda(s) ? 1u : 0u;
     const uint32_t header[SF37_SESSION_SNAPSHOT_U32_FIELDS] = {
@@ -6803,6 +7023,9 @@ int sf37_session_save_snapshot(sf37_session *s, sf37_session_snapshot *snap,
     for (uint32_t i = 0; i < SF37_SESSION_SNAPSHOT_U32_FIELDS; i++) {
         if (snapshot_write_u32(&w, header[i]) != 0) goto overflow;
     }
+    for (uint32_t il = 0; il < SF37_MAIN_LAYERS; il++) {
+        if (snapshot_write_u32(&w, row_counts[il]) != 0) goto overflow;
+    }
     for (int i = 0; i < s->checkpoint.len; i++) {
         if (snapshot_write_u32(&w, (uint32_t)s->checkpoint.v[i]) != 0) goto overflow;
     }
@@ -6814,10 +7037,12 @@ int sf37_session_save_snapshot(sf37_session *s, sf37_session_snapshot *snap,
     if (session_uses_cuda(s)) {
 #ifdef SF37_USE_CUDA
         uint8_t *row_buf = xmalloc((size_t)kv_row * sizeof(float));
-        const uint32_t first_pos = token_count - live_rows;
         for (uint32_t il = 0; il < SF37_MAIN_LAYERS; il++) {
-            for (uint32_t r = 0; r < live_rows; r++) {
-                const uint32_t phys = (first_pos + r) % s->cuda_state.cache_cap;
+            const uint32_t rows = row_counts[il];
+            const uint32_t first_pos = token_count - rows;
+            const uint32_t cache_cap = s->cuda_state.cache_cap[il];
+            for (uint32_t r = 0; r < rows; r++) {
+                const uint32_t phys = (first_pos + r) % cache_cap;
                 const uint64_t off = (uint64_t)phys * kv_row * sizeof(float);
                 if (!sf37_cuda_tensor_read(s->cuda_state.k_cache[il], off, row_buf,
                                            kv_row * sizeof(float)) ||
@@ -6836,15 +7061,16 @@ int sf37_session_save_snapshot(sf37_session *s, sf37_session_snapshot *snap,
     } else {
         for (uint32_t il = 0; il < SF37_MAIN_LAYERS; il++) {
             const sf37_layer_kv_cache *layer = &s->cpu_cache.layer[il];
-            if (layer->n < live_rows) {
+            const uint32_t rows = row_counts[il];
+            if (layer->n < rows) {
                 snapshot_set_err(err, errlen, "CPU KV cache has fewer live rows than checkpoint");
                 return 1;
             }
-            const uint32_t start = layer->n - live_rows;
+            const uint32_t start = layer->n - rows;
             if (snapshot_write_bytes(&w, layer->k + (uint64_t)start * kv_row,
-                                     (uint64_t)live_rows * kv_row * sizeof(float)) != 0 ||
+                                     (uint64_t)rows * kv_row * sizeof(float)) != 0 ||
                 snapshot_write_bytes(&w, layer->v + (uint64_t)start * kv_row,
-                                     (uint64_t)live_rows * kv_row * sizeof(float)) != 0) {
+                                     (uint64_t)rows * kv_row * sizeof(float)) != 0) {
                 goto overflow;
             }
         }
@@ -6876,6 +7102,13 @@ int sf37_session_load_snapshot(sf37_session *s, const sf37_session_snapshot *sna
         snapshot_set_err(err, errlen, "unsupported session snapshot version");
         return 1;
     }
+    uint32_t row_counts[SF37_MAIN_LAYERS];
+    for (uint32_t il = 0; il < SF37_MAIN_LAYERS; il++) {
+        if (snapshot_read_u32(&r, &row_counts[il]) != 0) {
+            snapshot_set_err(err, errlen, "truncated session snapshot KV row counts");
+            return 1;
+        }
+    }
     const uint32_t saved_ctx = h[2];
     const uint32_t token_count = h[3];
     const uint32_t live_rows = h[4];
@@ -6889,6 +7122,31 @@ int sf37_session_load_snapshot(sf37_session *s, const sf37_session_snapshot *sna
         live_rows != (token_count < saved_ctx ? token_count : saved_ctx)) {
         snapshot_set_err(err, errlen, "session snapshot has invalid token/cache row counts");
         return 1;
+    }
+    for (uint32_t il = 0; il < SF37_MAIN_LAYERS; il++) {
+        const uint32_t rows = row_counts[il];
+        if (rows > live_rows) {
+            snapshot_set_err(err, errlen, "session snapshot has too many KV rows for layer %u", il);
+            return 1;
+        }
+        if (layer_is_full(il)) {
+            if (rows != live_rows) {
+                snapshot_set_err(err, errlen, "session snapshot is missing full-attention KV rows");
+                return 1;
+            }
+        } else {
+            const uint32_t needed = live_rows < SF37_SLIDING_WINDOW ?
+                                    live_rows : SF37_SLIDING_WINDOW;
+            if (rows < needed) {
+                snapshot_set_err(err, errlen, "session snapshot is missing sliding-window KV rows");
+                return 1;
+            }
+        }
+        const uint32_t cap = session_layer_kv_cap(s, il);
+        if (cap != 0 && rows > cap) {
+            snapshot_set_err(err, errlen, "session snapshot KV rows do not fit current cache");
+            return 1;
+        }
     }
     if (h[5] != SF37_MAIN_LAYERS ||
         h[6] != SF37_KV_HEADS ||
@@ -6922,10 +7180,12 @@ int sf37_session_load_snapshot(sf37_session *s, const sf37_session_snapshot *sna
     if (session_uses_cuda(s)) {
 #ifdef SF37_USE_CUDA
         uint8_t *row_buf = xmalloc((size_t)kv_row * sizeof(float));
-        const uint32_t first_pos = token_count - live_rows;
         for (uint32_t il = 0; il < SF37_MAIN_LAYERS; il++) {
-            for (uint32_t rr = 0; rr < live_rows; rr++) {
-                const uint32_t phys = (first_pos + rr) % s->cuda_state.cache_cap;
+            const uint32_t rows = row_counts[il];
+            const uint32_t first_pos = token_count - rows;
+            const uint32_t cache_cap = s->cuda_state.cache_cap[il];
+            for (uint32_t rr = 0; rr < rows; rr++) {
+                const uint32_t phys = (first_pos + rr) % cache_cap;
                 const uint64_t off = (uint64_t)phys * kv_row * sizeof(float);
                 if (snapshot_read_bytes(&r, row_buf, kv_row * sizeof(float)) != 0 ||
                     !sf37_cuda_tensor_write(s->cuda_state.k_cache[il], off, row_buf,
@@ -6953,15 +7213,16 @@ int sf37_session_load_snapshot(sf37_session *s, const sf37_session_snapshot *sna
     } else {
         for (uint32_t il = 0; il < SF37_MAIN_LAYERS; il++) {
             sf37_layer_kv_cache *layer = &s->cpu_cache.layer[il];
+            const uint32_t rows = row_counts[il];
             if (snapshot_read_bytes(&r, layer->k,
-                                    (uint64_t)live_rows * kv_row * sizeof(float)) != 0 ||
+                                    (uint64_t)rows * kv_row * sizeof(float)) != 0 ||
                 snapshot_read_bytes(&r, layer->v,
-                                    (uint64_t)live_rows * kv_row * sizeof(float)) != 0) {
+                                    (uint64_t)rows * kv_row * sizeof(float)) != 0) {
                 sf37_tokens_free(&new_checkpoint);
                 snapshot_set_err(err, errlen, "truncated CPU KV cache in session snapshot");
                 return 1;
             }
-            layer->n = live_rows;
+            layer->n = rows;
         }
     }
     if (r.pos != r.len) {
@@ -7301,6 +7562,11 @@ int sf37_session_ctx(sf37_session *s) {
 
 uint64_t sf37_session_kv_bytes(sf37_session *s) {
     if (!s) return 0;
+#ifdef SF37_USE_CUDA
+    if (session_uses_cuda(s) && s->cuda_state_ready && s->cuda_state.kv_cache_bytes != 0) {
+        return s->cuda_state.kv_cache_bytes;
+    }
+#endif
     const uint64_t row = (uint64_t)SF37_KV_HEADS * SF37_HEAD_DIM;
     return (uint64_t)SF37_MAIN_LAYERS * (uint64_t)s->ctx_size * row * 2u * sizeof(float);
 }
