@@ -37,6 +37,7 @@ int sf37_cuda_cache_q8_f16_range(const void *model_map, uint64_t model_size,
                                  const char *label);
 
 sf37_cuda_tensor *sf37_cuda_tensor_alloc(uint64_t bytes);
+sf37_cuda_tensor *sf37_cuda_tensor_alloc_managed(uint64_t bytes);
 void sf37_cuda_tensor_free(sf37_cuda_tensor *tensor);
 uint64_t sf37_cuda_tensor_bytes(const sf37_cuda_tensor *tensor);
 int sf37_cuda_tensor_write(sf37_cuda_tensor *tensor, uint64_t offset,
@@ -101,6 +102,20 @@ int sf37_cuda_attention_decode_heads(sf37_cuda_tensor *out_heads,
                                      uint32_t head_dim,
                                      int sliding,
                                      uint32_t window);
+int sf37_cuda_attention_decode_heads_at(sf37_cuda_tensor *out_heads,
+                                        const sf37_cuda_tensor *q,
+                                        const sf37_cuda_tensor *k_cache,
+                                        const sf37_cuda_tensor *v_cache,
+                                        const sf37_cuda_tensor *head_gate,
+                                        uint32_t pos,
+                                        uint32_t cache_cap,
+                                        uint32_t q_heads,
+                                        uint32_t kv_heads,
+                                        uint32_t head_dim,
+                                        int sliding,
+                                        uint32_t window);
+int sf37_cuda_should_use_managed_kv_cache(uint64_t kv_cache_bytes,
+                                          uint64_t context_bytes);
 int sf37_cuda_matvec_q8_0(sf37_cuda_tensor *out,
                           const sf37_cuda_tensor *weights,
                           uint64_t in_dim, uint64_t out_dim,
