@@ -1818,6 +1818,50 @@ __global__ static void embed_tokens_bf16_kernel(float *out,
     out[gid] = sf37_bf16_to_f32_dev(emb[(uint64_t)(uint32_t)tok * dim + d]);
 }
 
+__global__ static void embed_token_bf16_kernel(float *out,
+                                               const uint16_t *emb,
+                                               int32_t token,
+                                               uint64_t dim,
+                                               uint64_t vocab) {
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= dim) return;
+    if (token < 0 || (uint64_t)token >= vocab) {
+        out[gid] = 0.0f;
+        return;
+    }
+    out[gid] = sf37_bf16_to_f32_dev(emb[(uint64_t)(uint32_t)token * dim + gid]);
+}
+
+extern "C" int sf37_cuda_embed_token_bf16_mapped(sf37_cuda_tensor *out,
+                                                  const void *model_map,
+                                                  uint64_t model_size,
+                                                  uint64_t weight_offset,
+                                                  uint64_t dim,
+                                                  uint64_t vocab,
+                                                  int32_t token) {
+    if (!out || !model_map || dim == 0 || vocab == 0) return 0;
+    if (vocab > UINT64_MAX / dim / sizeof(uint16_t) ||
+        dim > UINT64_MAX / sizeof(float)) return 0;
+    const uint64_t weight_bytes = vocab * dim * sizeof(uint16_t);
+    const uint64_t out_bytes = dim * sizeof(float);
+    if (!mapped_range_ok(model_size, weight_offset, weight_bytes) ||
+        out->bytes < out_bytes) {
+        return 0;
+    }
+    const uint16_t *emb = (const uint16_t *)cuda_model_range_ptr(model_map,
+                                                                 weight_offset,
+                                                                 weight_bytes,
+                                                                 "embed_token_bf16");
+    if (!emb) return 0;
+    embed_token_bf16_kernel<<<(unsigned)((dim + 255u) / 256u), 256>>>(
+            (float *)out->ptr,
+            emb,
+            token,
+            dim,
+            vocab);
+    return cuda_ok(cudaGetLastError(), "embed_token_bf16 mapped launch");
+}
+
 extern "C" int sf37_cuda_embed_tokens_bf16_mapped(sf37_cuda_tensor *out,
                                                    const void *model_map,
                                                    uint64_t model_size,
