@@ -1901,6 +1901,10 @@ __device__ static float warp_sum_f32(float v) {
     return v;
 }
 
+__device__ static float dot4_f32(float4 a, float4 b) {
+    return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+}
+
 __device__ static float sf37_bf16_to_f32_dev(uint16_t x) {
     return __uint_as_float((uint32_t)x << 16);
 }
@@ -2313,6 +2317,76 @@ __global__ static void attention_decode_heads128_warp_kernel(float *out_heads,
     oh[lane + 96u] = o3 * inv * gate;
 }
 
+__global__ static void attention_decode_heads128_kvgroup_kernel(float *out_heads,
+                                                                const float *q,
+                                                                const float *k_cache,
+                                                                const float *v_cache,
+                                                                const float *head_gate,
+                                                                uint32_t n_cache,
+                                                                uint32_t cache_cap,
+                                                                uint32_t q_heads,
+                                                                uint32_t kv_heads,
+                                                                int sliding,
+                                                                uint32_t window) {
+    if (n_cache == 0) return;
+    const uint32_t repeat = q_heads / kv_heads;
+    const uint32_t kvh = blockIdx.x;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t local_head = threadIdx.x >> 5u;
+    const uint32_t h = kvh * repeat + local_head;
+    const uint64_t kv_row = (uint64_t)kv_heads * 128u;
+    const float4 *q4 = (const float4 *)(q + (uint64_t)h * 128u);
+    const float4 qv = q4[lane];
+    const float scale = rsqrtf(128.0f);
+
+    uint32_t start = 0;
+    if (sliding && n_cache > window) start = n_cache - window;
+
+    __shared__ float4 kv_sh[64];
+    float max_s = -INFINITY;
+    float sum_s = 0.0f;
+    float4 ov = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    const unsigned mask = 0xffffffffu;
+
+    for (uint32_t r = start; r < n_cache; r++) {
+        const uint32_t row = r % cache_cap;
+        const float4 *k4 = (const float4 *)(k_cache + (uint64_t)row * kv_row +
+                                            (uint64_t)kvh * 128u);
+        const float4 *v4 = (const float4 *)(v_cache + (uint64_t)row * kv_row +
+                                            (uint64_t)kvh * 128u);
+        for (uint32_t c4 = threadIdx.x; c4 < 64u; c4 += blockDim.x) {
+            if (c4 < 32u) kv_sh[c4] = k4[c4];
+            else kv_sh[c4] = v4[c4 - 32u];
+        }
+        __syncthreads();
+
+        const float4 kv = kv_sh[lane];
+        const float4 vv = kv_sh[32u + lane];
+        float score = dot4_f32(qv, kv);
+        score = warp_sum_f32(score);
+        score = __shfl_sync(mask, score, 0) * scale;
+
+        const float new_m = fmaxf(max_s, score);
+        const float old_scale = expf(max_s - new_m);
+        const float row_scale = expf(score - new_m);
+        sum_s = sum_s * old_scale + row_scale;
+        ov.x = ov.x * old_scale + vv.x * row_scale;
+        ov.y = ov.y * old_scale + vv.y * row_scale;
+        ov.z = ov.z * old_scale + vv.z * row_scale;
+        ov.w = ov.w * old_scale + vv.w * row_scale;
+        max_s = new_m;
+        __syncthreads();
+    }
+
+    const float gate = sf37_sigmoid_dev(head_gate[h]);
+    const float inv = sum_s > 0.0f ? 1.0f / sum_s : 0.0f;
+    float4 *oh4 = (float4 *)(out_heads + (uint64_t)h * 128u);
+    oh4[lane] = make_float4(ov.x * inv * gate,
+                            ov.y * inv * gate,
+                            ov.z * inv * gate,
+                            ov.w * inv * gate);
+}
+
 __global__ static void attention_decode_heads_at_kernel(float *out_heads,
                                                         const float *q,
                                                         const float *k_cache,
@@ -2442,6 +2516,81 @@ __global__ static void attention_decode_heads128_warp_at_kernel(float *out_heads
     oh[lane + 96u] = o3 * inv * gate;
 }
 
+__global__ static void attention_decode_heads128_kvgroup_at_kernel(float *out_heads,
+                                                                   const float *q,
+                                                                   const float *k_cache,
+                                                                   const float *v_cache,
+                                                                   const float *head_gate,
+                                                                   uint32_t pos,
+                                                                   uint32_t cache_cap,
+                                                                   uint32_t q_heads,
+                                                                   uint32_t kv_heads,
+                                                                   int sliding,
+                                                                   uint32_t window) {
+    if (cache_cap == 0) return;
+    const uint32_t repeat = q_heads / kv_heads;
+    const uint32_t kvh = blockIdx.x;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t local_head = threadIdx.x >> 5u;
+    const uint32_t h = kvh * repeat + local_head;
+    const uint64_t kv_row = (uint64_t)kv_heads * 128u;
+    const float4 *q4 = (const float4 *)(q + (uint64_t)h * 128u);
+    const float4 qv = q4[lane];
+    const float scale = rsqrtf(128.0f);
+
+    const uint32_t have = pos + 1u;
+    uint32_t start = 0;
+    if (have > cache_cap) start = have - cache_cap;
+    if (sliding && have > window) {
+        const uint32_t sw = have - window;
+        if (sw > start) start = sw;
+    }
+
+    __shared__ float4 kv_sh[64];
+    float max_s = -INFINITY;
+    float sum_s = 0.0f;
+    float4 ov = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    const unsigned mask = 0xffffffffu;
+
+    for (uint32_t r = start; r <= pos; r++) {
+        const uint32_t row = r % cache_cap;
+        const float4 *k4 = (const float4 *)(k_cache + (uint64_t)row * kv_row +
+                                            (uint64_t)kvh * 128u);
+        const float4 *v4 = (const float4 *)(v_cache + (uint64_t)row * kv_row +
+                                            (uint64_t)kvh * 128u);
+        for (uint32_t c4 = threadIdx.x; c4 < 64u; c4 += blockDim.x) {
+            if (c4 < 32u) kv_sh[c4] = k4[c4];
+            else kv_sh[c4] = v4[c4 - 32u];
+        }
+        __syncthreads();
+
+        const float4 kv = kv_sh[lane];
+        const float4 vv = kv_sh[32u + lane];
+        float score = dot4_f32(qv, kv);
+        score = warp_sum_f32(score);
+        score = __shfl_sync(mask, score, 0) * scale;
+
+        const float new_m = fmaxf(max_s, score);
+        const float old_scale = expf(max_s - new_m);
+        const float row_scale = expf(score - new_m);
+        sum_s = sum_s * old_scale + row_scale;
+        ov.x = ov.x * old_scale + vv.x * row_scale;
+        ov.y = ov.y * old_scale + vv.y * row_scale;
+        ov.z = ov.z * old_scale + vv.z * row_scale;
+        ov.w = ov.w * old_scale + vv.w * row_scale;
+        max_s = new_m;
+        __syncthreads();
+    }
+
+    const float gate = sf37_sigmoid_dev(head_gate[h]);
+    const float inv = sum_s > 0.0f ? 1.0f / sum_s : 0.0f;
+    float4 *oh4 = (float4 *)(out_heads + (uint64_t)h * 128u);
+    oh4[lane] = make_float4(ov.x * inv * gate,
+                            ov.y * inv * gate,
+                            ov.z * inv * gate,
+                            ov.w * inv * gate);
+}
+
 extern "C" int sf37_cuda_attention_decode_heads(sf37_cuda_tensor *out_heads,
                                                  const sf37_cuda_tensor *q,
                                                  const sf37_cuda_tensor *k_cache,
@@ -2456,6 +2605,7 @@ extern "C" int sf37_cuda_attention_decode_heads(sf37_cuda_tensor *out_heads,
                                                  uint32_t window) {
     if (!out_heads || !q || !k_cache || !v_cache || !head_gate ||
         kv_heads == 0 || q_heads % kv_heads != 0 || n_cache > cache_cap) return 0;
+    const uint32_t repeat = q_heads / kv_heads;
     const uint64_t q_dim = (uint64_t)q_heads * head_dim;
     const uint64_t kv_dim = (uint64_t)kv_heads * head_dim;
     if (out_heads->bytes < q_dim * sizeof(float) ||
@@ -2464,6 +2614,19 @@ extern "C" int sf37_cuda_attention_decode_heads(sf37_cuda_tensor *out_heads,
         v_cache->bytes < (uint64_t)cache_cap * kv_dim * sizeof(float) ||
         head_gate->bytes < (uint64_t)q_heads * sizeof(float)) return 0;
     if (head_dim == 128u && !cuda_env_present("SF37_CUDA_NO_WARP_ATTENTION", NULL)) {
+        if (repeat <= 16u &&
+            !cuda_env_present("SF37_CUDA_NO_KV_GROUP_ATTENTION",
+                              "DS4_CUDA_NO_KV_GROUP_ATTENTION")) {
+            attention_decode_heads128_kvgroup_kernel<<<(unsigned)kv_heads,
+                                                       (unsigned)(repeat * 32u)>>>(
+                    (float *)out_heads->ptr,
+                    (const float *)q->ptr,
+                    (const float *)k_cache->ptr,
+                    (const float *)v_cache->ptr,
+                    (const float *)head_gate->ptr,
+                    n_cache, cache_cap, q_heads, kv_heads, sliding, window);
+            return cuda_ok(cudaGetLastError(), "attention_decode_heads128 kvgroup launch");
+        }
         attention_decode_heads128_warp_kernel<<<(unsigned)((q_heads + 7u) / 8u), 256>>>(
                 (float *)out_heads->ptr,
                 (const float *)q->ptr,
@@ -2500,6 +2663,7 @@ extern "C" int sf37_cuda_attention_decode_heads_at(sf37_cuda_tensor *out_heads,
         head_dim == 0) {
         return 0;
     }
+    const uint32_t repeat = q_heads / kv_heads;
     const uint64_t q_dim = (uint64_t)q_heads * head_dim;
     const uint64_t kv_dim = (uint64_t)kv_heads * head_dim;
     if (out_heads->bytes < q_dim * sizeof(float) ||
@@ -2508,6 +2672,19 @@ extern "C" int sf37_cuda_attention_decode_heads_at(sf37_cuda_tensor *out_heads,
         v_cache->bytes < (uint64_t)cache_cap * kv_dim * sizeof(float) ||
         head_gate->bytes < (uint64_t)q_heads * sizeof(float)) return 0;
     if (head_dim == 128u && !cuda_env_present("SF37_CUDA_NO_WARP_ATTENTION", NULL)) {
+        if (repeat <= 16u &&
+            !cuda_env_present("SF37_CUDA_NO_KV_GROUP_ATTENTION",
+                              "DS4_CUDA_NO_KV_GROUP_ATTENTION")) {
+            attention_decode_heads128_kvgroup_at_kernel<<<(unsigned)kv_heads,
+                                                          (unsigned)(repeat * 32u)>>>(
+                    (float *)out_heads->ptr,
+                    (const float *)q->ptr,
+                    (const float *)k_cache->ptr,
+                    (const float *)v_cache->ptr,
+                    (const float *)head_gate->ptr,
+                    pos, cache_cap, q_heads, kv_heads, sliding, window);
+            return cuda_ok(cudaGetLastError(), "attention_decode_heads128_at kvgroup launch");
+        }
         attention_decode_heads128_warp_at_kernel<<<(unsigned)((q_heads + 7u) / 8u), 256>>>(
                 (float *)out_heads->ptr,
                 (const float *)q->ptr,
