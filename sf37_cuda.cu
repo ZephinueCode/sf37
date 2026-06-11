@@ -2146,6 +2146,59 @@ __global__ static void rope_split_half_kernel(float *x,
     head[pair + half] = b * c + a * s;
 }
 
+__global__ static void head_rms_norm_rope_qk_bf16_kernel(float *q,
+                                                         float *k,
+                                                         const uint16_t *q_weight,
+                                                         const uint16_t *k_weight,
+                                                         uint32_t q_heads,
+                                                         uint32_t kv_heads,
+                                                         uint32_t head_dim,
+                                                         uint32_t rotary_dim,
+                                                         double theta,
+                                                         int llama3,
+                                                         uint32_t pos,
+                                                         float eps) {
+    const uint32_t h = blockIdx.x;
+    const uint32_t total_heads = q_heads + kv_heads;
+    if (h >= total_heads) return;
+    const int is_q = h < q_heads;
+    const uint32_t local_h = is_q ? h : h - q_heads;
+    float *head = is_q
+        ? q + (uint64_t)local_h * head_dim
+        : k + (uint64_t)local_h * head_dim;
+    const uint16_t *weight = is_q ? q_weight : k_weight;
+
+    float sum = 0.0f;
+    for (uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        const float v = head[i];
+        sum += v * v;
+    }
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+
+    const float scale = rsqrtf(partial[0] / (float)head_dim + eps);
+    for (uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        head[i] = head[i] * scale * (sf37_bf16_to_f32_dev(weight[i]) + 1.0f);
+    }
+    __syncthreads();
+
+    const uint32_t half = rotary_dim / 2u;
+    for (uint32_t pair = threadIdx.x; pair < half; pair += blockDim.x) {
+        const double inv = sf37_inv_freq_dev(pair, rotary_dim, theta, llama3);
+        const float c = cosf((float)((double)pos * inv));
+        const float s = sinf((float)((double)pos * inv));
+        const float a = head[pair];
+        const float b = head[pair + half];
+        head[pair] = a * c - b * s;
+        head[pair + half] = b * c + a * s;
+    }
+}
+
 extern "C" int sf37_cuda_rope_split_half(sf37_cuda_tensor *x,
                                           uint32_t n_head,
                                           uint32_t head_dim,
@@ -2195,6 +2248,45 @@ extern "C" int sf37_cuda_gqa_single_token_heads(sf37_cuda_tensor *out_heads,
             (const float *)head_gate->ptr,
             q_heads, kv_heads, head_dim);
     return cuda_ok(cudaGetLastError(), "gqa single-token heads launch");
+}
+
+static uint32_t cuda_parse_u32_env2(const char *sf37_name,
+                                    const char *ds4_name,
+                                    uint32_t fallback,
+                                    uint32_t lo,
+                                    uint32_t hi) {
+    const char *env = cuda_env_value(sf37_name, ds4_name);
+    if (!env || !env[0]) return fallback;
+    char *end = NULL;
+    unsigned long v = strtoul(env, &end, 10);
+    if (end == env || *end != '\0') return fallback;
+    if (v < (unsigned long)lo) v = lo;
+    if (v > (unsigned long)hi) v = hi;
+    return (uint32_t)v;
+}
+
+static int cuda_attention_split_enabled(void) {
+    return !cuda_env_present("SF37_CUDA_NO_SPLIT_ATTENTION",
+                             "DS4_CUDA_NO_SPLIT_ATTENTION");
+}
+
+static uint32_t cuda_attention_split_min_rows(void) {
+    return cuda_parse_u32_env2("SF37_CUDA_SPLIT_ATTENTION_MIN_ROWS",
+                               "DS4_CUDA_SPLIT_ATTENTION_MIN_ROWS",
+                               1024u, 128u, 1048576u);
+}
+
+static uint32_t cuda_attention_split_chunk_rows(void) {
+    return cuda_parse_u32_env2("SF37_CUDA_SPLIT_ATTENTION_CHUNK_ROWS",
+                               "DS4_CUDA_SPLIT_ATTENTION_CHUNK_ROWS",
+                               256u, 64u, 4096u);
+}
+
+__device__ __forceinline__ static float float4_component(float4 v, uint32_t c) {
+    if (c == 0u) return v.x;
+    if (c == 1u) return v.y;
+    if (c == 2u) return v.z;
+    return v.w;
 }
 
 __global__ static void attention_decode_heads_kernel(float *out_heads,
@@ -2385,6 +2477,139 @@ __global__ static void attention_decode_heads128_kvgroup_kernel(float *out_heads
                             ov.y * inv * gate,
                             ov.z * inv * gate,
                             ov.w * inv * gate);
+}
+
+__global__ static void attention_decode_heads128_kvgroup_split_kernel(
+        float4 *partial_out,
+        float *partial_m,
+        float *partial_s,
+        const float *q,
+        const float *k_cache,
+        const float *v_cache,
+        uint32_t start,
+        uint32_t end,
+        uint32_t chunk_rows,
+        uint32_t cache_cap,
+        uint32_t q_heads,
+        uint32_t kv_heads) {
+    const uint32_t split = blockIdx.y;
+    const uint32_t kvh = blockIdx.x;
+    const uint32_t repeat = q_heads / kv_heads;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t local_head = threadIdx.x >> 5u;
+    const uint32_t h = kvh * repeat + local_head;
+    const uint64_t kv_row = (uint64_t)kv_heads * 128u;
+    const uint32_t split_start = start + split * chunk_rows;
+    uint32_t split_end = split_start + chunk_rows;
+    if (split_end > end) split_end = end;
+
+    const float4 *q4 = (const float4 *)(q + (uint64_t)h * 128u);
+    const float4 qv = q4[lane];
+    const float scale = rsqrtf(128.0f);
+    __shared__ float4 kv_sh[4u * 64u];
+
+    float max_s = -INFINITY;
+    float sum_s = 0.0f;
+    float4 ov = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    const unsigned mask = 0xffffffffu;
+
+    for (uint32_t r0 = split_start; r0 < split_end; r0 += 4u) {
+        const uint32_t nr = split_end - r0 < 4u ? split_end - r0 : 4u;
+        for (uint32_t off = threadIdx.x; off < nr * 64u; off += blockDim.x) {
+            const uint32_t rr = off >> 6u;
+            const uint32_t c4 = off & 63u;
+            const uint32_t row = (r0 + rr) % cache_cap;
+            const float4 *src = c4 < 32u
+                ? (const float4 *)(k_cache + (uint64_t)row * kv_row +
+                                   (uint64_t)kvh * 128u)
+                : (const float4 *)(v_cache + (uint64_t)row * kv_row +
+                                   (uint64_t)kvh * 128u);
+            kv_sh[off] = src[c4 & 31u];
+        }
+        __syncthreads();
+
+        for (uint32_t rr = 0; rr < nr; rr++) {
+            const float4 kv = kv_sh[rr * 64u + lane];
+            const float4 vv = kv_sh[rr * 64u + 32u + lane];
+            float score = dot4_f32(qv, kv);
+            score = warp_sum_f32(score);
+            score = __shfl_sync(mask, score, 0) * scale;
+
+            const float new_m = fmaxf(max_s, score);
+            const float old_scale = expf(max_s - new_m);
+            const float row_scale = expf(score - new_m);
+            sum_s = sum_s * old_scale + row_scale;
+            ov.x = ov.x * old_scale + vv.x * row_scale;
+            ov.y = ov.y * old_scale + vv.y * row_scale;
+            ov.z = ov.z * old_scale + vv.z * row_scale;
+            ov.w = ov.w * old_scale + vv.w * row_scale;
+            max_s = new_m;
+        }
+        __syncthreads();
+    }
+
+    const uint64_t stat_idx = (uint64_t)split * q_heads + h;
+    if (lane == 0u) {
+        partial_m[stat_idx] = max_s;
+        partial_s[stat_idx] = sum_s;
+    }
+    partial_out[stat_idx * 32u + lane] = ov;
+}
+
+__global__ static void attention_decode_heads128_split_reduce_kernel(
+        float *out_heads,
+        const float4 *partial_out,
+        float *partial_m,
+        const float *partial_s,
+        const float *head_gate,
+        uint32_t split_count,
+        uint32_t q_heads) {
+    enum { THREADS = 128 };
+    const uint32_t h = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    __shared__ float red[THREADS];
+
+    float local_m = -INFINITY;
+    for (uint32_t s = tid; s < split_count; s += THREADS) {
+        local_m = fmaxf(local_m, partial_m[(uint64_t)s * q_heads + h]);
+    }
+    red[tid] = local_m;
+    __syncthreads();
+    for (uint32_t stride = THREADS >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) red[tid] = fmaxf(red[tid], red[tid + stride]);
+        __syncthreads();
+    }
+    const float max_s = red[0];
+
+    float local_sum = 0.0f;
+    for (uint32_t s = tid; s < split_count; s += THREADS) {
+        const uint64_t idx = (uint64_t)s * q_heads + h;
+        const float w = expf(partial_m[idx] - max_s);
+        partial_m[idx] = w;
+        local_sum += partial_s[idx] * w;
+    }
+    red[tid] = local_sum;
+    __syncthreads();
+    for (uint32_t stride = THREADS >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) red[tid] += red[tid + stride];
+        __syncthreads();
+    }
+    const float denom = red[0];
+    const float inv = denom > 0.0f ? 1.0f / denom : 0.0f;
+    const float gate = sf37_sigmoid_dev(head_gate[h]);
+
+    if (tid < 128u) {
+        const uint32_t lane4 = tid >> 2u;
+        const uint32_t comp = tid & 3u;
+        float acc = 0.0f;
+        for (uint32_t s = 0; s < split_count; s++) {
+            const uint64_t idx = (uint64_t)s * q_heads + h;
+            const float w = partial_m[idx];
+            const float4 v = partial_out[idx * 32u + lane4];
+            acc += float4_component(v, comp) * w;
+        }
+        out_heads[(uint64_t)h * 128u + tid] = acc * inv * gate;
+    }
 }
 
 __global__ static void attention_decode_heads_at_kernel(float *out_heads,
@@ -2591,6 +2816,74 @@ __global__ static void attention_decode_heads128_kvgroup_at_kernel(float *out_he
                             ov.w * inv * gate);
 }
 
+static int attention_decode_heads128_split_launch(float *out_heads,
+                                                  const float *q,
+                                                  const float *k_cache,
+                                                  const float *v_cache,
+                                                  const float *head_gate,
+                                                  uint32_t start,
+                                                  uint32_t end,
+                                                  uint32_t cache_cap,
+                                                  uint32_t q_heads,
+                                                  uint32_t kv_heads,
+                                                  uint32_t repeat,
+                                                  const char *label) {
+    if (end <= start || cache_cap == 0 || kv_heads == 0 || q_heads == 0) return 0;
+    const uint32_t chunk_rows = cuda_attention_split_chunk_rows();
+    const uint32_t rows = end - start;
+    const uint32_t split_count = (rows + chunk_rows - 1u) / chunk_rows;
+    if (split_count <= 1u) return 0;
+    if (split_count > 65535u || kv_heads > 65535u) return 0;
+
+    const uint64_t partial_vecs = (uint64_t)split_count * q_heads * 32u;
+    const uint64_t partial_stats = (uint64_t)split_count * q_heads;
+    if (partial_vecs > UINT64_MAX / sizeof(float4) ||
+        partial_stats > UINT64_MAX / sizeof(float)) {
+        return 0;
+    }
+    const uint64_t out_bytes = partial_vecs * sizeof(float4);
+    const uint64_t m_off = cuda_align_u64(out_bytes, 256u);
+    const uint64_t m_bytes = partial_stats * sizeof(float);
+    const uint64_t s_off = cuda_align_u64(m_off + m_bytes, 256u);
+    const uint64_t s_bytes = partial_stats * sizeof(float);
+    if (s_off > UINT64_MAX - s_bytes) return 0;
+
+    char *tmp = (char *)cuda_tmp_alloc(s_off + s_bytes,
+                                       label ? label : "attention split partials");
+    if (!tmp) return 0;
+    float4 *partial_out = (float4 *)tmp;
+    float *partial_m = (float *)(tmp + m_off);
+    float *partial_s = (float *)(tmp + s_off);
+
+    dim3 grid((unsigned)kv_heads, (unsigned)split_count, 1u);
+    attention_decode_heads128_kvgroup_split_kernel<<<grid, (unsigned)(repeat * 32u)>>>(
+            partial_out,
+            partial_m,
+            partial_s,
+            q,
+            k_cache,
+            v_cache,
+            start,
+            end,
+            chunk_rows,
+            cache_cap,
+            q_heads,
+            kv_heads);
+    if (!cuda_ok(cudaGetLastError(), "attention_decode_heads128 split stage launch")) {
+        return 0;
+    }
+
+    attention_decode_heads128_split_reduce_kernel<<<(unsigned)q_heads, 128>>>(
+            out_heads,
+            partial_out,
+            partial_m,
+            partial_s,
+            head_gate,
+            split_count,
+            q_heads);
+    return cuda_ok(cudaGetLastError(), "attention_decode_heads128 split reduce launch");
+}
+
 extern "C" int sf37_cuda_attention_decode_heads(sf37_cuda_tensor *out_heads,
                                                  const sf37_cuda_tensor *q,
                                                  const sf37_cuda_tensor *k_cache,
@@ -2617,6 +2910,27 @@ extern "C" int sf37_cuda_attention_decode_heads(sf37_cuda_tensor *out_heads,
         if (repeat <= 16u &&
             !cuda_env_present("SF37_CUDA_NO_KV_GROUP_ATTENTION",
                               "DS4_CUDA_NO_KV_GROUP_ATTENTION")) {
+            uint32_t start = 0;
+            if (sliding && n_cache > window) start = n_cache - window;
+            if (cuda_attention_split_enabled() &&
+                n_cache > start &&
+                n_cache - start >= cuda_attention_split_min_rows()) {
+                if (attention_decode_heads128_split_launch(
+                            (float *)out_heads->ptr,
+                            (const float *)q->ptr,
+                            (const float *)k_cache->ptr,
+                            (const float *)v_cache->ptr,
+                            (const float *)head_gate->ptr,
+                            start,
+                            n_cache,
+                            cache_cap,
+                            q_heads,
+                            kv_heads,
+                            repeat,
+                            "attention split decode")) {
+                    return 1;
+                }
+            }
             attention_decode_heads128_kvgroup_kernel<<<(unsigned)kv_heads,
                                                        (unsigned)(repeat * 32u)>>>(
                     (float *)out_heads->ptr,
@@ -2675,6 +2989,32 @@ extern "C" int sf37_cuda_attention_decode_heads_at(sf37_cuda_tensor *out_heads,
         if (repeat <= 16u &&
             !cuda_env_present("SF37_CUDA_NO_KV_GROUP_ATTENTION",
                               "DS4_CUDA_NO_KV_GROUP_ATTENTION")) {
+            const uint32_t have = pos + 1u;
+            uint32_t start = 0;
+            if (have > cache_cap) start = have - cache_cap;
+            if (sliding && have > window) {
+                const uint32_t sw = have - window;
+                if (sw > start) start = sw;
+            }
+            if (cuda_attention_split_enabled() &&
+                have > start &&
+                have - start >= cuda_attention_split_min_rows()) {
+                if (attention_decode_heads128_split_launch(
+                            (float *)out_heads->ptr,
+                            (const float *)q->ptr,
+                            (const float *)k_cache->ptr,
+                            (const float *)v_cache->ptr,
+                            (const float *)head_gate->ptr,
+                            start,
+                            pos + 1u,
+                            cache_cap,
+                            q_heads,
+                            kv_heads,
+                            repeat,
+                            "attention split decode_at")) {
+                    return 1;
+                }
+            }
             attention_decode_heads128_kvgroup_at_kernel<<<(unsigned)kv_heads,
                                                           (unsigned)(repeat * 32u)>>>(
                     (float *)out_heads->ptr,
@@ -3075,6 +3415,66 @@ __global__ static void matvec_q8_0_pair_preq_kernel(float *out0,
         out0[row] = acc0;
         out1[row] = acc1;
     }
+}
+
+__global__ static void matvec_q8_0_qkvg_preq_kernel(float *q_out,
+                                                    float *k_out,
+                                                    float *v_out,
+                                                    float *g_out,
+                                                    const uint8_t *q_w,
+                                                    const uint8_t *k_w,
+                                                    const uint8_t *v_w,
+                                                    const uint8_t *g_w,
+                                                    const int8_t *xq,
+                                                    const float *xscale,
+                                                    uint64_t in_dim,
+                                                    uint64_t q_dim,
+                                                    uint64_t kv_dim,
+                                                    uint64_t g_dim,
+                                                    uint64_t blocks,
+                                                    int use_dp4a) {
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint64_t total = q_dim + kv_dim + kv_dim + g_dim;
+    if (row >= total) return;
+
+    const uint64_t row_bytes = blocks * SF37_Q8_BLOCK_SIZE;
+    const uint8_t *wr = NULL;
+    float *out = NULL;
+    uint64_t local_row = row;
+    if (local_row < q_dim) {
+        wr = q_w + local_row * row_bytes;
+        out = q_out + local_row;
+    } else {
+        local_row -= q_dim;
+        if (local_row < kv_dim) {
+            wr = k_w + local_row * row_bytes;
+            out = k_out + local_row;
+        } else {
+            local_row -= kv_dim;
+            if (local_row < kv_dim) {
+                wr = v_w + local_row * row_bytes;
+                out = v_out + local_row;
+            } else {
+                local_row -= kv_dim;
+                wr = g_w + local_row * row_bytes;
+                out = g_out + local_row;
+            }
+        }
+    }
+
+    float acc = 0.0f;
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        const uint64_t i0 = b * 32u;
+        const uint64_t bn = in_dim - i0 < 32u ? in_dim - i0 : 32u;
+        const uint8_t *blk = wr + b * SF37_Q8_BLOCK_SIZE;
+        const float ws = __half2float(*(const __half *)blk);
+        const int8_t *wq = (const int8_t *)(blk + 2);
+        const int8_t *xqb = xq + b * 32u;
+        acc += ws * xscale[b] * (float)dot_i8_block_dev(wq, xqb, bn, use_dp4a);
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0u) *out = acc;
 }
 
 extern "C" int sf37_cuda_matvec_q8_0(sf37_cuda_tensor *out,
@@ -5548,6 +5948,61 @@ extern "C" int sf37_cuda_head_rms_norm_weight1_bf16_mapped(sf37_cuda_tensor *x,
     return cuda_ok(cudaGetLastError(), "head_rms_norm_weight1_bf16 mapped launch");
 }
 
+extern "C" int sf37_cuda_head_rms_norm_rope_qk_bf16_mapped(sf37_cuda_tensor *q,
+                                                            sf37_cuda_tensor *k,
+                                                            const void *model_map,
+                                                            uint64_t model_size,
+                                                            uint64_t q_weight_offset,
+                                                            uint64_t k_weight_offset,
+                                                            uint32_t q_heads,
+                                                            uint32_t kv_heads,
+                                                            uint32_t head_dim,
+                                                            uint32_t rotary_dim,
+                                                            double theta,
+                                                            int llama3,
+                                                            uint32_t pos,
+                                                            float eps) {
+    if (cuda_env_present("SF37_CUDA_NO_FUSED_NORM_ROPE",
+                         "DS4_CUDA_NO_FUSED_NORM_ROPE")) {
+        return 0;
+    }
+    if (!q || !k || !model_map ||
+        q_heads == 0 || kv_heads == 0 || head_dim == 0 ||
+        rotary_dim == 0 || rotary_dim > head_dim || (rotary_dim & 1u)) {
+        return 0;
+    }
+    const uint64_t weight_bytes = (uint64_t)head_dim * sizeof(uint16_t);
+    if (!mapped_range_ok(model_size, q_weight_offset, weight_bytes) ||
+        !mapped_range_ok(model_size, k_weight_offset, weight_bytes) ||
+        q->bytes < (uint64_t)q_heads * head_dim * sizeof(float) ||
+        k->bytes < (uint64_t)kv_heads * head_dim * sizeof(float)) {
+        return 0;
+    }
+    const uint16_t *qw = (const uint16_t *)cuda_model_range_ptr(model_map,
+                                                                q_weight_offset,
+                                                                weight_bytes,
+                                                                "q_head_norm_bf16");
+    const uint16_t *kw = (const uint16_t *)cuda_model_range_ptr(model_map,
+                                                                k_weight_offset,
+                                                                weight_bytes,
+                                                                "k_head_norm_bf16");
+    if (!qw || !kw) return 0;
+    head_rms_norm_rope_qk_bf16_kernel<<<(unsigned)(q_heads + kv_heads), 256>>>(
+            (float *)q->ptr,
+            (float *)k->ptr,
+            qw,
+            kw,
+            q_heads,
+            kv_heads,
+            head_dim,
+            rotary_dim,
+            theta,
+            llama3,
+            pos,
+            eps);
+    return cuda_ok(cudaGetLastError(), "head_rms_norm_rope_qk_bf16 mapped launch");
+}
+
 __global__ static void head_rms_norm_weight1_bf16_batch_kernel(float *x,
                                                                const uint16_t *weight,
                                                                uint32_t n_tok,
@@ -5746,6 +6201,96 @@ extern "C" int sf37_cuda_matvec_q8_0_mapped(sf37_cuda_tensor *out,
     matvec_q8_0_preq_kernel<<<(unsigned)((out_dim + 7u) / 8u), 256>>>(
             (float *)out->ptr, w, xq, xscale, in_dim, out_dim, blocks, use_dp4a);
     return cuda_ok(cudaGetLastError(), "q8_0 mapped matvec launch");
+}
+
+extern "C" int sf37_cuda_matvec_q8_0_qkvg_mapped(sf37_cuda_tensor *q_out,
+                                                  sf37_cuda_tensor *k_out,
+                                                  sf37_cuda_tensor *v_out,
+                                                  sf37_cuda_tensor *g_out,
+                                                  const void *model_map,
+                                                  uint64_t model_size,
+                                                  uint64_t q_weight_offset,
+                                                  uint64_t k_weight_offset,
+                                                  uint64_t v_weight_offset,
+                                                  uint64_t g_weight_offset,
+                                                  uint64_t in_dim,
+                                                  uint64_t q_dim,
+                                                  uint64_t kv_dim,
+                                                  uint64_t g_dim,
+                                                  const sf37_cuda_tensor *x) {
+    if (cuda_env_present("SF37_CUDA_NO_QKVG_FUSED",
+                         "DS4_CUDA_NO_QKVG_FUSED")) {
+        return 0;
+    }
+    if (!q_out || !k_out || !v_out || !g_out || !x || !model_map ||
+        in_dim == 0 || q_dim == 0 || kv_dim == 0 || g_dim == 0) {
+        return 0;
+    }
+    const uint64_t blocks = (in_dim + 31u) / 32u;
+    if (blocks != 0 &&
+        (q_dim > UINT64_MAX / blocks / SF37_Q8_BLOCK_SIZE ||
+         kv_dim > UINT64_MAX / blocks / SF37_Q8_BLOCK_SIZE ||
+         g_dim > UINT64_MAX / blocks / SF37_Q8_BLOCK_SIZE)) {
+        return 0;
+    }
+    if (q_dim > UINT64_MAX - kv_dim ||
+        q_dim + kv_dim > UINT64_MAX - kv_dim ||
+        q_dim + kv_dim + kv_dim > UINT64_MAX - g_dim) {
+        return 0;
+    }
+    const uint64_t q_weight_bytes = q_dim * blocks * SF37_Q8_BLOCK_SIZE;
+    const uint64_t kv_weight_bytes = kv_dim * blocks * SF37_Q8_BLOCK_SIZE;
+    const uint64_t g_weight_bytes = g_dim * blocks * SF37_Q8_BLOCK_SIZE;
+    if (!mapped_range_ok(model_size, q_weight_offset, q_weight_bytes) ||
+        !mapped_range_ok(model_size, k_weight_offset, kv_weight_bytes) ||
+        !mapped_range_ok(model_size, v_weight_offset, kv_weight_bytes) ||
+        !mapped_range_ok(model_size, g_weight_offset, g_weight_bytes) ||
+        q_out->bytes < q_dim * sizeof(float) ||
+        k_out->bytes < kv_dim * sizeof(float) ||
+        v_out->bytes < kv_dim * sizeof(float) ||
+        g_out->bytes < g_dim * sizeof(float) ||
+        x->bytes < in_dim * sizeof(float)) {
+        return 0;
+    }
+
+    const uint8_t *qw = (const uint8_t *)cuda_model_range_ptr(model_map, q_weight_offset,
+                                                              q_weight_bytes, "q8_0_q_proj");
+    const uint8_t *kw = (const uint8_t *)cuda_model_range_ptr(model_map, k_weight_offset,
+                                                              kv_weight_bytes, "q8_0_k_proj");
+    const uint8_t *vw = (const uint8_t *)cuda_model_range_ptr(model_map, v_weight_offset,
+                                                              kv_weight_bytes, "q8_0_v_proj");
+    const uint8_t *gw = (const uint8_t *)cuda_model_range_ptr(model_map, g_weight_offset,
+                                                              g_weight_bytes, "q8_0_g_proj");
+    if (!qw || !kw || !vw || !gw) return 0;
+
+    const uint64_t xq_bytes = blocks * 32u;
+    const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
+    const uint64_t tmp_bytes = scale_offset + blocks * sizeof(float);
+    void *tmp = cuda_tmp_alloc(tmp_bytes, "q8_0 qkvg mapped prequant");
+    if (!tmp) return 0;
+    int8_t *xq = (int8_t *)tmp;
+    float *xscale = (float *)((char *)tmp + scale_offset);
+    quantize_q8_0_f32_kernel<<<(unsigned)blocks, 32>>>(
+            xq, xscale, (const float *)x->ptr, in_dim, blocks);
+    if (!cuda_ok(cudaGetLastError(), "q8_0 qkvg quantize launch")) return 0;
+
+    const uint64_t total = q_dim + kv_dim + kv_dim + g_dim;
+    const int use_dp4a = cuda_q8_use_dp4a();
+    matvec_q8_0_qkvg_preq_kernel<<<(unsigned)((total + 7u) / 8u), 256>>>(
+            (float *)q_out->ptr,
+            (float *)k_out->ptr,
+            (float *)v_out->ptr,
+            (float *)g_out->ptr,
+            qw, kw, vw, gw,
+            xq,
+            xscale,
+            in_dim,
+            q_dim,
+            kv_dim,
+            g_dim,
+            blocks,
+            use_dp4a);
+    return cuda_ok(cudaGetLastError(), "q8_0 qkvg mapped matvec launch");
 }
 
 extern "C" int sf37_cuda_matmul_q8_0_mapped(sf37_cuda_tensor *out,
