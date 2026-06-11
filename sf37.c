@@ -3309,32 +3309,50 @@ static int cuda_decode_layer(sf37_engine *e, sf37_cuda_decode_state *s,
                                                             l->input_norm->abs_offset,
                                                             SF37_EMBD, SF37_RMS_EPS),
                      "input rms");
-    CUDA_LAYER_CHECK(sf37_cuda_matvec_q8_0_mapped(s->q, e->gguf.map, e->gguf.size,
-                                                  l->q_proj->abs_offset,
-                                                  SF37_EMBD, q_dim, s->attn_norm), "q_proj");
-    CUDA_LAYER_CHECK(sf37_cuda_matvec_q8_0_mapped(s->k, e->gguf.map, e->gguf.size,
-                                                  l->k_proj->abs_offset,
-                                                  SF37_EMBD, kv_dim, s->attn_norm), "k_proj");
-    CUDA_LAYER_CHECK(sf37_cuda_matvec_q8_0_mapped(s->v, e->gguf.map, e->gguf.size,
-                                                  l->v_proj->abs_offset,
-                                                  SF37_EMBD, kv_dim, s->attn_norm), "v_proj");
-    CUDA_LAYER_CHECK(sf37_cuda_matvec_q8_0_mapped(s->head_gate, e->gguf.map, e->gguf.size,
-                                                  l->g_proj->abs_offset,
-                                                  SF37_EMBD, q_heads, s->attn_norm), "g_proj");
-    CUDA_LAYER_CHECK(sf37_cuda_head_rms_norm_weight1_bf16_mapped(s->q,
-                                                                 e->gguf.map, e->gguf.size,
-                                                                 l->q_norm->abs_offset,
-                                                                 q_heads, SF37_HEAD_DIM,
-                                                                 SF37_RMS_EPS), "q head norm");
-    CUDA_LAYER_CHECK(sf37_cuda_head_rms_norm_weight1_bf16_mapped(s->k,
-                                                                 e->gguf.map, e->gguf.size,
-                                                                 l->k_norm->abs_offset,
-                                                                 SF37_KV_HEADS, SF37_HEAD_DIM,
-                                                                 SF37_RMS_EPS), "k head norm");
-    CUDA_LAYER_CHECK(sf37_cuda_rope_split_half(s->q, q_heads, SF37_HEAD_DIM,
-                                               rotary_dim, theta, full, pos), "q rope");
-    CUDA_LAYER_CHECK(sf37_cuda_rope_split_half(s->k, SF37_KV_HEADS, SF37_HEAD_DIM,
-                                               rotary_dim, theta, full, pos), "k rope");
+    if (!sf37_cuda_matvec_q8_0_qkvg_mapped(s->q, s->k, s->v, s->head_gate,
+                                           e->gguf.map, e->gguf.size,
+                                           l->q_proj->abs_offset,
+                                           l->k_proj->abs_offset,
+                                           l->v_proj->abs_offset,
+                                           l->g_proj->abs_offset,
+                                           SF37_EMBD, q_dim, kv_dim, q_heads,
+                                           s->attn_norm)) {
+        CUDA_LAYER_CHECK(sf37_cuda_matvec_q8_0_mapped(s->q, e->gguf.map, e->gguf.size,
+                                                      l->q_proj->abs_offset,
+                                                      SF37_EMBD, q_dim, s->attn_norm), "q_proj");
+        CUDA_LAYER_CHECK(sf37_cuda_matvec_q8_0_mapped(s->k, e->gguf.map, e->gguf.size,
+                                                      l->k_proj->abs_offset,
+                                                      SF37_EMBD, kv_dim, s->attn_norm), "k_proj");
+        CUDA_LAYER_CHECK(sf37_cuda_matvec_q8_0_mapped(s->v, e->gguf.map, e->gguf.size,
+                                                      l->v_proj->abs_offset,
+                                                      SF37_EMBD, kv_dim, s->attn_norm), "v_proj");
+        CUDA_LAYER_CHECK(sf37_cuda_matvec_q8_0_mapped(s->head_gate, e->gguf.map, e->gguf.size,
+                                                      l->g_proj->abs_offset,
+                                                      SF37_EMBD, q_heads, s->attn_norm), "g_proj");
+    }
+    if (!sf37_cuda_head_rms_norm_rope_qk_bf16_mapped(s->q, s->k,
+                                                     e->gguf.map, e->gguf.size,
+                                                     l->q_norm->abs_offset,
+                                                     l->k_norm->abs_offset,
+                                                     q_heads, SF37_KV_HEADS,
+                                                     SF37_HEAD_DIM, rotary_dim,
+                                                     theta, full, pos,
+                                                     SF37_RMS_EPS)) {
+        CUDA_LAYER_CHECK(sf37_cuda_head_rms_norm_weight1_bf16_mapped(s->q,
+                                                                     e->gguf.map, e->gguf.size,
+                                                                     l->q_norm->abs_offset,
+                                                                     q_heads, SF37_HEAD_DIM,
+                                                                     SF37_RMS_EPS), "q head norm");
+        CUDA_LAYER_CHECK(sf37_cuda_head_rms_norm_weight1_bf16_mapped(s->k,
+                                                                     e->gguf.map, e->gguf.size,
+                                                                     l->k_norm->abs_offset,
+                                                                     SF37_KV_HEADS, SF37_HEAD_DIM,
+                                                                     SF37_RMS_EPS), "k head norm");
+        CUDA_LAYER_CHECK(sf37_cuda_rope_split_half(s->q, q_heads, SF37_HEAD_DIM,
+                                                   rotary_dim, theta, full, pos), "q rope");
+        CUDA_LAYER_CHECK(sf37_cuda_rope_split_half(s->k, SF37_KV_HEADS, SF37_HEAD_DIM,
+                                                   rotary_dim, theta, full, pos), "k rope");
+    }
     CUDA_LAYER_CHECK(sf37_cuda_store_kv_cache_batch(s->k_cache[il], s->v_cache[il],
                                                     s->k, s->v, pos, 1u,
                                                     cache_cap, kv_dim),
