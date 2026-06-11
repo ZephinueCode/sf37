@@ -5821,22 +5821,31 @@ static int cuda_prefill_layer(sf37_engine *e,
                                                                     SF37_EMBD, n_tok,
                                                                     SF37_RMS_EPS),
                        "input rms batch");
-    CUDA_PREFILL_CHECK(sf37_cuda_matmul_q8_0_mapped(p->q, e->gguf.map, e->gguf.size,
-                                                    l->q_proj->abs_offset,
-                                                    SF37_EMBD, q_dim, p->attn_norm, n_tok),
-                       "q_proj batch");
-    CUDA_PREFILL_CHECK(sf37_cuda_matmul_q8_0_mapped(p->k, e->gguf.map, e->gguf.size,
-                                                    l->k_proj->abs_offset,
-                                                    SF37_EMBD, kv_dim, p->attn_norm, n_tok),
-                       "k_proj batch");
-    CUDA_PREFILL_CHECK(sf37_cuda_matmul_q8_0_mapped(p->v, e->gguf.map, e->gguf.size,
-                                                    l->v_proj->abs_offset,
-                                                    SF37_EMBD, kv_dim, p->attn_norm, n_tok),
-                       "v_proj batch");
-    CUDA_PREFILL_CHECK(sf37_cuda_matmul_q8_0_mapped(p->head_gate, e->gguf.map, e->gguf.size,
-                                                    l->g_proj->abs_offset,
-                                                    SF37_EMBD, q_heads, p->attn_norm, n_tok),
-                       "g_proj batch");
+    if (!sf37_cuda_matmul_q8_0_qkvg_mapped(p->q, p->k, p->v, p->head_gate,
+                                            e->gguf.map, e->gguf.size,
+                                            l->q_proj->abs_offset,
+                                            l->k_proj->abs_offset,
+                                            l->v_proj->abs_offset,
+                                            l->g_proj->abs_offset,
+                                            SF37_EMBD, q_dim, kv_dim, q_heads,
+                                            p->attn_norm, n_tok)) {
+        CUDA_PREFILL_CHECK(sf37_cuda_matmul_q8_0_mapped(p->q, e->gguf.map, e->gguf.size,
+                                                        l->q_proj->abs_offset,
+                                                        SF37_EMBD, q_dim, p->attn_norm, n_tok),
+                           "q_proj batch");
+        CUDA_PREFILL_CHECK(sf37_cuda_matmul_q8_0_mapped(p->k, e->gguf.map, e->gguf.size,
+                                                        l->k_proj->abs_offset,
+                                                        SF37_EMBD, kv_dim, p->attn_norm, n_tok),
+                           "k_proj batch");
+        CUDA_PREFILL_CHECK(sf37_cuda_matmul_q8_0_mapped(p->v, e->gguf.map, e->gguf.size,
+                                                        l->v_proj->abs_offset,
+                                                        SF37_EMBD, kv_dim, p->attn_norm, n_tok),
+                           "v_proj batch");
+        CUDA_PREFILL_CHECK(sf37_cuda_matmul_q8_0_mapped(p->head_gate, e->gguf.map, e->gguf.size,
+                                                        l->g_proj->abs_offset,
+                                                        SF37_EMBD, q_heads, p->attn_norm, n_tok),
+                           "g_proj batch");
+    }
     CUDA_PREFILL_CHECK(sf37_cuda_head_rms_norm_weight1_bf16_batch_mapped(p->q,
                                                                          e->gguf.map, e->gguf.size,
                                                                          l->q_norm->abs_offset,
