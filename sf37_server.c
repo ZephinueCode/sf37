@@ -6405,7 +6405,9 @@ static char *build_responses_visible_assistant_suffix(const request *r,
     }
     buf_puts(&suffix, content ? content : "");
     append_official_tool_calls_text(&suffix, calls, &r->tool_orders);
-    buf_puts(&suffix, "<|im_end|>\n");
+    /* Leave the assistant end marker in the next suffix.  The live decode
+     * stops before evaluating <|im_end|>, so consuming it in the visible key
+     * would make a cache hit skip that token in KV. */
     return buf_take(&suffix);
 }
 
@@ -6423,7 +6425,8 @@ static char *build_toolless_thinking_visible_text(const request *r,
     buf visible = {0};
     buf_append(&visible, r->prompt_text, pt_len - tag_len);
     buf_puts(&visible, content ? content : "");
-    buf_puts(&visible, "<|im_end|>\n");
+    /* Keep <|im_end|> out of the key so a visible-prefix continuation evaluates
+     * the turn boundary before appending the next user turn. */
     return buf_take(&visible);
 }
 
@@ -9419,6 +9422,37 @@ static void test_chat_anthropic_and_completion_thinking_null_keeps_alias_default
     request_free(&r);
 }
 
+static void test_visible_live_keys_leave_end_marker_for_suffix(void) {
+    request r = {0};
+    r.think_mode = SF37_THINK_ENABLED;
+    r.prompt_text = xstrdup(
+        "<|im_start|>user\nQ<|im_end|>\n"
+        "<|im_start|>assistant\n<think>\n");
+    char *visible = build_toolless_thinking_visible_text(&r, "Answer");
+    TEST_ASSERT(visible != NULL);
+    TEST_ASSERT(visible && strstr(visible, "Answer<|im_end|>") == NULL);
+    TEST_ASSERT(visible && strlen(visible) >= strlen("Answer") &&
+                !strcmp(visible + strlen(visible) - strlen("Answer"), "Answer"));
+    buf future = {0};
+    buf_puts(&future, visible ? visible : "");
+    buf_puts(&future, "<|im_end|>\n<|im_start|>user\nnext");
+    TEST_ASSERT(future.ptr &&
+                !strncmp(future.ptr + strlen(visible ? visible : ""),
+                         "<|im_end|>\n", strlen("<|im_end|>\n")));
+    buf_free(&future);
+    free(visible);
+    request_free(&r);
+
+    request resp = {0};
+    resp.think_mode = SF37_THINK_ENABLED;
+    tool_calls calls = {0};
+    char *suffix = build_responses_visible_assistant_suffix(
+        &resp, "Visible answer", "hidden reasoning", &calls);
+    TEST_ASSERT(suffix != NULL);
+    TEST_ASSERT(suffix && !strcmp(suffix, "</think>Visible answer"));
+    free(suffix);
+}
+
 static void test_completion_request_array_prompt_and_sse_shape(void) {
     request r = {0};
     char err[256] = {0};
@@ -9964,6 +9998,7 @@ int main(void) {
     test_responses_reasoning_effort_null_keeps_alias_default();
     test_chat_and_anthropic_reasoning_effort_null_keeps_alias_default();
     test_chat_anthropic_and_completion_thinking_null_keeps_alias_default();
+    test_visible_live_keys_leave_end_marker_for_suffix();
     test_completion_request_array_prompt_and_sse_shape();
     test_completions_endpoint_routes_bad_request();
     test_anthropic_output_config_effort_controls_thinking();
